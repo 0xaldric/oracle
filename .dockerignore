@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+node_modules/
+evidence/
+.env
+.url_cache.json
+*.jpg
+*.html
+systemd/
+rush-*.service
+rush-*.timer
+start.sh
