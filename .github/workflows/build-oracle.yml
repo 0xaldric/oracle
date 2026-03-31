@@ -3,7 +3,6 @@ name: Build Oracle Docker Image
 on:
   push:
     branches: [main]
-    paths: [oracle/**]
   workflow_dispatch:
 
 env:
@@ -33,7 +32,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./oracle
+          context: .
           push: true
           tags: |
             ghcr.io/${{ env.IMAGE_NAME }}:latest
