@@ -73,7 +73,7 @@ FACTORY_ABI = [
         "inputs": [
             {"name": "_streamUrl",        "type": "string"},
             {"name": "_description",      "type": "string"},
-            {"name": "_roundDurationSecs","type": "uint256"},
+            {"name": "_roundDurationSecs", "type": "uint256"},
             {"name": "_minBet",           "type": "uint256"},
             {"name": "_maxBet",           "type": "uint256"},
             {"name": "_rangeLabels",      "type": "string[]"},
@@ -157,6 +157,16 @@ MARKET_ABI = [
     },
 ]
 
+MARKET_PLACEBET_ABI = [
+    {
+        "name": "placeBet",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [{"name": "rangeIndex", "type": "uint256"}],
+        "outputs": [],
+    },
+]
+
 FACTORY_READ_ABI = [
     {
         "name": "getActiveMarkets",
@@ -181,10 +191,14 @@ MARKET_RESOLVED_ABI = {
 UINT256_MAX = 2 ** 256 - 1
 MIN_BET_WEI = 10 ** 15               # 0.001 ETH
 MAX_BET_WEI = 10 ** 18               # 1 ETH
-DEFAULT_GAS  = 3_000_000
+DEFAULT_GAS = 3_000_000
 INTER_ROUND_SECS = 15
 MAX_TX_RETRIES = 3
 TX_WAIT_TIMEOUT = 120                 # seconds to wait for receipt
+
+# House bot — transparent liquidity seeder
+HOUSE_BOT_KEY = os.environ.get("HOUSE_BOT_KEY", "")
+HOUSE_BOT_BET_WEI = MIN_BET_WEI      # 0.001 ETH per side
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -196,7 +210,7 @@ class Config:
         self.private_key: str = self._require("PRIVATE_KEY")
         self.rpc_url: str = os.environ.get(
             "RPC_URL",
-            "https://bnb-testnet.g.alchemy.com/v2/G8uDr9bgqVaqdpPXoTD1N",
+            "https://base-mainnet.core.chainstack.com/977532e58b2430d1f01739e7d209d236",
         )
         self.factory_address: str = self._require_address("FACTORY_ADDRESS")
         self.fee_recipient: str = os.environ.get(
@@ -256,7 +270,8 @@ class ChainClient:
     """Thin wrapper around web3.py for signing and sending transactions."""
 
     def __init__(self, cfg: Config) -> None:
-        self.w3 = Web3(Web3.HTTPProvider(cfg.rpc_url, request_kwargs={"timeout": 60}))
+        self.w3 = Web3(Web3.HTTPProvider(
+            cfg.rpc_url, request_kwargs={"timeout": 60}))
         if not self.w3.is_connected():
             log.error("Cannot connect to RPC: %s", cfg.rpc_url)
             sys.exit(1)
@@ -266,7 +281,8 @@ class ChainClient:
             address=Web3.to_checksum_address(cfg.factory_address),
             abi=FACTORY_ABI,
         )
-        log.info("Chain: connected to %s (chain_id=%d)", cfg.rpc_url, self.w3.eth.chain_id)
+        log.info("Chain: connected to %s (chain_id=%d)",
+                 cfg.rpc_url, self.w3.eth.chain_id)
         log.info("Oracle wallet: %s", self.account.address)
 
     # ── Low-level tx helper ───────────────────────────────────────────────────
@@ -286,7 +302,8 @@ class ChainClient:
         Raises:
             Exception: on RPC error or signing failure.
         """
-        nonce = self.w3.eth.get_transaction_count(self.account.address, "pending")
+        nonce = self.w3.eth.get_transaction_count(
+            self.account.address, "pending")
         gas_price = self.w3.eth.gas_price
 
         tx = fn_call.build_transaction({
@@ -338,8 +355,8 @@ class ChainClient:
             Exception on RPC or event-parsing failure.
         """
         labels = [f"Under {threshold}", f"Over {threshold}"]
-        mins   = [0, threshold + 1]
-        maxs   = [threshold, UINT256_MAX]
+        mins = [0, threshold + 1]
+        maxs = [threshold, UINT256_MAX]
 
         fn_call = self.factory.functions.createMarket(
             stream_url,
@@ -360,7 +377,8 @@ class ChainClient:
             raise RuntimeError(f"createMarket reverted — tx: {tx_hash}")
 
         # Parse MarketCreated event to extract market address
-        event_sig = self.w3.keccak(text="MarketCreated(uint256,address,string,uint256,bool)").hex()
+        event_sig = self.w3.keccak(
+            text="MarketCreated(uint256,address,string,uint256,bool)").hex()
         market_address: Optional[str] = None
 
         for log_entry in receipt.get("logs", []):
@@ -368,7 +386,8 @@ class ChainClient:
             if topics and topics[0].hex() == event_sig:
                 # marketAddress is the second indexed topic (topics[2])
                 raw_addr = topics[2].hex()
-                market_address = Web3.to_checksum_address("0x" + raw_addr[-40:])
+                market_address = Web3.to_checksum_address(
+                    "0x" + raw_addr[-40:])
                 break
 
         if not market_address:
@@ -425,7 +444,8 @@ class ChainClient:
             tx_hash = self._send_tx(fn_call, gas=200_000)
             receipt = self.wait_for_receipt(tx_hash)
             if receipt["status"] == 1:
-                log.info("Market cancelled: %s (tx: %s)", market_address, tx_hash)
+                log.info("Market cancelled: %s (tx: %s)",
+                         market_address, tx_hash)
                 return tx_hash
             else:
                 log.warning("cancelMarket reverted for %s", market_address)
@@ -467,7 +487,8 @@ class ChainClient:
             tx_hash = self._send_tx(fn_call, gas=3_000_000)
             receipt = self.wait_for_receipt(tx_hash)
             if receipt["status"] == 1:
-                log.info("Winnings distributed: %s (tx: %s)", market_address, tx_hash)
+                log.info("Winnings distributed: %s (tx: %s)",
+                         market_address, tx_hash)
                 return tx_hash
             else:
                 log.warning("distributeAll reverted for %s", market_address)
@@ -488,13 +509,70 @@ class ChainClient:
             tx_hash = self._send_tx(fn_call, gas=3_000_000)
             receipt = self.wait_for_receipt(tx_hash)
             if receipt["status"] == 1:
-                log.info("Refunds distributed: %s (tx: %s)", market_address, tx_hash)
+                log.info("Refunds distributed: %s (tx: %s)",
+                         market_address, tx_hash)
                 return tx_hash
             else:
                 log.warning("refundAll reverted for %s", market_address)
         except Exception as exc:
             log.warning("refundAll failed for %s: %s", market_address, exc)
         return None
+
+    # ── House bot — transparent liquidity seeder ─────────────────────────────
+
+    def house_bet(self, market_address: str) -> bool:
+        """
+        Place minimum bets on both sides of a market using the house bot wallet.
+        Returns True if both bets succeed, False otherwise.
+        """
+        if not HOUSE_BOT_KEY:
+            return False
+
+        try:
+            house_account = Account.from_key(HOUSE_BOT_KEY)
+            market = self.w3.eth.contract(
+                address=Web3.to_checksum_address(market_address),
+                abi=MARKET_PLACEBET_ABI,
+            )
+            gas_price = self.w3.eth.gas_price
+
+            # Bet on UNDER (range 0)
+            nonce = self.w3.eth.get_transaction_count(
+                house_account.address, "pending")
+            tx0 = market.functions.placeBet(0).build_transaction({
+                "from": house_account.address,
+                "nonce": nonce,
+                "gas": 200_000,
+                "gasPrice": gas_price,
+                "value": HOUSE_BOT_BET_WEI,
+            })
+            signed0 = house_account.sign_transaction(tx0)
+            hash0 = self.w3.eth.send_raw_transaction(
+                signed0.raw_transaction).hex()
+
+            # Bet on OVER (range 1)
+            nonce1 = nonce + 1
+            tx1 = market.functions.placeBet(1).build_transaction({
+                "from": house_account.address,
+                "nonce": nonce1,
+                "gas": 200_000,
+                "gasPrice": gas_price,
+                "value": HOUSE_BOT_BET_WEI,
+            })
+            signed1 = house_account.sign_transaction(tx1)
+            hash1 = self.w3.eth.send_raw_transaction(
+                signed1.raw_transaction).hex()
+
+            log.info(
+                "House bot seeded %s: UNDER tx=%s, OVER tx=%s (%.4f ETH each)",
+                market_address, hash0[:10], hash1[:10],
+                HOUSE_BOT_BET_WEI / 10**18,
+            )
+            return True
+
+        except Exception as exc:
+            log.warning("House bot bet failed for %s: %s", market_address, exc)
+            return False
 
 
 # ── Stream client (connects to persistent stream_server.py via WS) ───────────
@@ -521,9 +599,11 @@ class StreamClient:
                 log.info("[StreamClient] Connected to %s", self.ws_url)
                 return
             except Exception:
-                log.debug("[StreamClient] stream_server not ready, retrying...")
+                log.debug(
+                    "[StreamClient] stream_server not ready, retrying...")
                 await asyncio.sleep(2)
-        raise RuntimeError(f"Could not connect to stream_server at {self.ws_url} after {timeout}s")
+        raise RuntimeError(
+            f"Could not connect to stream_server at {self.ws_url} after {timeout}s")
 
     async def ensure_connected(self) -> None:
         """Reconnect if WS is closed."""
@@ -552,11 +632,13 @@ class StreamClient:
             raw = await asyncio.wait_for(self._ws.recv(), timeout=5)
             data = json.loads(raw)
             if data.get("type") == "round_started":
-                log.info("[StreamClient] Round %d started on stream_server", round_id)
+                log.info(
+                    "[StreamClient] Round %d started on stream_server", round_id)
             else:
                 log.warning("[StreamClient] Unexpected response: %s", data)
         except asyncio.TimeoutError:
-            log.warning("[StreamClient] No ack for start_round (proceeding anyway)")
+            log.warning(
+                "[StreamClient] No ack for start_round (proceeding anyway)")
 
     async def wait_for_round_complete(self, timeout: float) -> Optional[dict]:
         """Wait for round_complete message from stream_server."""
@@ -707,7 +789,8 @@ class RushRoundManager:
         try:
             import base64
             url = "https://rest.ably.io/channels/rush%3Amarket/messages"
-            payload = json.dumps({"name": event, "data": json.dumps(data)}).encode("utf-8")
+            payload = json.dumps(
+                {"name": event, "data": json.dumps(data)}).encode("utf-8")
             req = urllib.request.Request(
                 url,
                 data=payload,
@@ -735,14 +818,15 @@ class RushRoundManager:
     async def _run_round(self) -> None:
         self.round_number += 1
         camera = self.cameras[(self.round_number - 1) % len(self.cameras)]
-        cam_id     = camera["id"]
+        cam_id = camera["id"]
         stream_url = camera.get("streamUrl") or camera.get("imageUrl", "")
-        cam_name   = camera["name"]
-        threshold  = self.thresholds[cam_id].value
+        cam_name = camera["name"]
+        threshold = self.thresholds[cam_id].value
 
         log.info("Round #%d starting", self.round_number)
         log.info("Camera: %s (%s)", cam_name, stream_url)
-        log.info("Threshold: %d  (Under %d / Over %d)", threshold, threshold, threshold)
+        log.info("Threshold: %d  (Under %d / Over %d)",
+                 threshold, threshold, threshold)
 
         # ── Step 0: Check for active markets (cancel orphans or skip) ─────────
         try:
@@ -779,7 +863,8 @@ class RushRoundManager:
                             "ts": int(time.time() * 1000),
                         })
                         self.chain.refund_all(addr)
-                    log.info("Cancelled %d orphan market(s) — proceeding to create new one", len(active))
+                    log.info(
+                        "Cancelled %d orphan market(s) — proceeding to create new one", len(active))
                 else:
                     log.warning(
                         "Active market(s) still within lock window: %s — skipping round",
@@ -787,7 +872,8 @@ class RushRoundManager:
                     )
                     return
         except Exception as exc:
-            log.warning("Could not check active markets (proceeding anyway): %s", exc)
+            log.warning(
+                "Could not check active markets (proceeding anyway): %s", exc)
 
         # ── Step 1: Create market ─────────────────────────────────────────────
         description = f"{cam_name} — How many vehicles in 5 min?"
@@ -836,10 +922,14 @@ class RushRoundManager:
                 if attempt < MAX_TX_RETRIES:
                     await asyncio.sleep(5 * attempt)
                 else:
-                    log.error("All createMarket attempts exhausted — skipping round")
+                    log.error(
+                        "All createMarket attempts exhausted — skipping round")
                     return
 
         assert market_address is not None
+
+        # ── Step 1.5: House bot seeds both sides ─────────────────────────────
+        self.chain.house_bet(market_address)
 
         # ── Step 2: Start counting on persistent stream_server ────────────────
         log.info("Counting vehicles for %ds...", self.cfg.round_duration)
@@ -861,7 +951,8 @@ class RushRoundManager:
 
             if result is None:
                 # Fallback: read result.json
-                log.warning("No round_complete via WS — reading result.json fallback")
+                log.warning(
+                    "No round_complete via WS — reading result.json fallback")
                 result = self.stream_client.read_result()
 
             if result is None:
@@ -913,7 +1004,8 @@ class RushRoundManager:
             pool_over = market_contract.functions.poolByRange(1).call()
 
             if total_pool == 0:
-                log.info("No bets placed — cancelling market (no gas wasted on resolve)")
+                log.info(
+                    "No bets placed — cancelling market (no gas wasted on resolve)")
                 self.chain.cancel_market(market_address)
                 self._publish_ably("market_cancelled", {
                     "marketAddress": market_address,
@@ -989,7 +1081,8 @@ class RushRoundManager:
                 pool_over / 10**18,
             )
         except Exception as exc:
-            log.warning("Could not check pool (proceeding to resolve anyway): %s", exc)
+            log.warning(
+                "Could not check pool (proceeding to resolve anyway): %s", exc)
 
         # ── Step 3: Resolve market ────────────────────────────────────────────
         winning_label = f"Under {threshold}" if count <= threshold else f"Over {threshold}"
@@ -1025,7 +1118,8 @@ class RushRoundManager:
                 if attempt < MAX_TX_RETRIES:
                     await asyncio.sleep(5 * attempt)
                 else:
-                    log.error("All resolveMarket attempts exhausted — market left unresolved")
+                    log.error(
+                        "All resolveMarket attempts exhausted — market left unresolved")
 
         # Auto-distribute winnings to all bettors
         if resolve_tx:
@@ -1105,7 +1199,8 @@ class RushRoundManager:
                 log.info("Task cancelled — stopping.")
                 break
             except Exception as exc:
-                log.exception("Unhandled exception in round %d: %s", self.round_number, exc)
+                log.exception("Unhandled exception in round %d: %s",
+                              self.round_number, exc)
                 log.info("Waiting 30s before retrying...")
                 await asyncio.sleep(30)
                 continue

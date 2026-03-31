@@ -49,19 +49,19 @@ except ImportError:
     WEB3_AVAILABLE = False
 
 # ── paths ─────────────────────────────────────────────────────────────────────
-_HERE          = Path(__file__).parent
+_HERE = Path(__file__).parent
 HEARTBEAT_FILE = Path("/tmp/rush_oracle_heartbeat.json")
-LOG_FILE       = Path("/tmp/rush_oracle.log")
-LOCK_FILE      = Path("/tmp/rush_oracle.lock")
-ROUND_MANAGER  = _HERE / "round_manager_rush.py"
+LOG_FILE = Path("/tmp/rush_oracle.log")
+LOCK_FILE = Path("/tmp/rush_oracle.lock")
+ROUND_MANAGER = _HERE / "round_manager_rush.py"
 
 # ── timing constants ──────────────────────────────────────────────────────────
-HEALTH_CHECK_INTERVAL  = 30        # seconds between watchdog ticks
-BACKOFF_RESET_STABLE   = 300       # 5 min stable → reset backoff
-BACKOFF_STEPS          = [5, 10, 30, 60]
-RAPID_RESTART_WINDOW   = 600       # 10 min window for rapid-restart alert
+HEALTH_CHECK_INTERVAL = 30        # seconds between watchdog ticks
+BACKOFF_RESET_STABLE = 300       # 5 min stable → reset backoff
+BACKOFF_STEPS = [5, 10, 30, 60]
+RAPID_RESTART_WINDOW = 600       # 10 min window for rapid-restart alert
 RAPID_RESTART_THRESHOLD = 3        # alert if >= this many restarts in window
-ORPHAN_GRACE_SECS      = 600       # 10 min past end-of-round before cancelling
+ORPHAN_GRACE_SECS = 600       # 10 min past end-of-round before cancelling
 
 # ── ABI fragments ─────────────────────────────────────────────────────────────
 FACTORY_READ_ABI = [
@@ -105,7 +105,7 @@ MARKET_READ_ABI = [
     },
 ]
 
-MARKET_STATE_OPEN   = 0
+MARKET_STATE_OPEN = 0
 MARKET_STATE_LOCKED = 1
 
 DEFAULT_GAS = 200_000
@@ -170,7 +170,8 @@ class LockFile:
                 log.warning("Removing stale lock file (dead PID)")
                 self.path.unlink(missing_ok=True)
 
-        self._fd = os.open(str(self.path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+        self._fd = os.open(str(self.path), os.O_CREAT |
+                           os.O_WRONLY | os.O_TRUNC)
         try:
             fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -223,7 +224,7 @@ def send_alert(message: str) -> None:
 def _fmt_uptime(seconds: float) -> str:
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
-    m, s   = divmod(rem, 60)
+    m, s = divmod(rem, 60)
     if h:
         return f"{h}h{m:02d}m"
     if m:
@@ -241,20 +242,22 @@ def _build_web3() -> Optional[tuple]:
         log.warning("web3 not installed — orphan detection skipped")
         return None
 
-    private_key      = os.environ.get("PRIVATE_KEY", "").strip()
-    rpc_url          = os.environ.get(
+    private_key = os.environ.get("PRIVATE_KEY", "").strip()
+    rpc_url = os.environ.get(
         "RPC_URL",
         "https://base-mainnet.core.chainstack.com/977532e58b2430d1f01739e7d209d236",
     )
-    factory_raw      = os.environ.get("FACTORY_ADDRESS", "").strip()
-    round_duration   = int(os.environ.get("ROUND_DURATION", "300"))
+    factory_raw = os.environ.get("FACTORY_ADDRESS", "").strip()
+    round_duration = int(os.environ.get("ROUND_DURATION", "300"))
 
     if not private_key or not factory_raw:
-        log.warning("PRIVATE_KEY or FACTORY_ADDRESS not set — orphan detection skipped")
+        log.warning(
+            "PRIVATE_KEY or FACTORY_ADDRESS not set — orphan detection skipped")
         return None
 
     if not Web3.is_address(factory_raw):
-        log.error("FACTORY_ADDRESS is not a valid Ethereum address: %s", factory_raw)
+        log.error(
+            "FACTORY_ADDRESS is not a valid Ethereum address: %s", factory_raw)
         return None
 
     w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 60}))
@@ -300,7 +303,7 @@ def cancel_orphan_markets() -> int:
         market = w3.eth.contract(address=checksum, abi=MARKET_READ_ABI)
 
         try:
-            state     = market.functions.state().call()
+            state = market.functions.state().call()
             created_at = market.functions.createdAt().call()
         except Exception as exc:
             log.warning("Could not read market %s: %s", checksum, exc)
@@ -312,7 +315,8 @@ def cancel_orphan_markets() -> int:
         expiry = created_at + round_duration + ORPHAN_GRACE_SECS
         if now < expiry:
             remaining = expiry - now
-            log.debug("Market %s still within window (%ds remaining)", checksum, remaining)
+            log.debug("Market %s still within window (%ds remaining)",
+                      checksum, remaining)
             continue
 
         age = now - created_at
@@ -327,21 +331,21 @@ def cancel_orphan_markets() -> int:
         )
 
         try:
-            nonce     = w3.eth.get_transaction_count(account.address, "pending")
+            nonce = w3.eth.get_transaction_count(account.address, "pending")
             gas_price = w3.eth.gas_price
-            fn_call   = market.functions.cancelMarket()
-            tx        = fn_call.build_transaction({
+            fn_call = market.functions.cancelMarket()
+            tx = fn_call.build_transaction({
                 "from":     account.address,
                 "nonce":    nonce,
                 "gas":      DEFAULT_GAS,
                 "gasPrice": gas_price,
             })
-            signed   = account.sign_transaction(tx)
-            tx_hash  = w3.eth.send_raw_transaction(signed.raw_transaction)
+            signed = account.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
 
             # Poll for receipt
             deadline = time.time() + 120
-            receipt  = None
+            receipt = None
             while time.time() < deadline:
                 try:
                     receipt = w3.eth.get_transaction_receipt(tx_hash)
@@ -352,7 +356,8 @@ def cancel_orphan_markets() -> int:
                 time.sleep(2)
 
             if receipt and receipt["status"] == 1:
-                log.info("Orphan market cancelled: %s (tx: %s)", checksum, tx_hash.hex())
+                log.info("Orphan market cancelled: %s (tx: %s)",
+                         checksum, tx_hash.hex())
                 cancelled += 1
             else:
                 log.error("cancelMarket reverted or timed out for %s", checksum)
@@ -403,11 +408,11 @@ class Watchdog:
     """
 
     def __init__(self, passthrough_args: list[str]) -> None:
-        self._passthrough   = passthrough_args
+        self._passthrough = passthrough_args
         self._proc: Optional[subprocess.Popen] = None
-        self._shutdown      = False
-        self._start_time    = time.time()
-        self._proc_start    = 0.0
+        self._shutdown = False
+        self._start_time = time.time()
+        self._proc_start = 0.0
         self._restart_count = 0
         self._last_round_time: Optional[float] = None
         self._backoff_index = 0
@@ -461,9 +466,10 @@ class Watchdog:
     # ── backoff logic ─────────────────────────────────────────────────────────
 
     def _backoff_delay(self) -> int:
-        idx   = min(self._backoff_index, len(BACKOFF_STEPS) - 1)
+        idx = min(self._backoff_index, len(BACKOFF_STEPS) - 1)
         delay = BACKOFF_STEPS[idx]
-        self._backoff_index = min(self._backoff_index + 1, len(BACKOFF_STEPS) - 1)
+        self._backoff_index = min(
+            self._backoff_index + 1, len(BACKOFF_STEPS) - 1)
         return delay
 
     def _maybe_reset_backoff(self) -> None:
@@ -499,7 +505,7 @@ class Watchdog:
     # ── heartbeat ─────────────────────────────────────────────────────────────
 
     def _tick_heartbeat(self, status: str) -> None:
-        pid    = self._proc.pid if self._proc and self._proc.poll() is None else None
+        pid = self._proc.pid if self._proc and self._proc.poll() is None else None
         uptime = time.time() - self._start_time
         write_heartbeat(
             pid=pid,
@@ -587,7 +593,8 @@ class Watchdog:
                 break
 
             delay = self._backoff_delay()
-            log.info("Waiting %ds before restart (backoff step %d)...", delay, self._backoff_index)
+            log.info("Waiting %ds before restart (backoff step %d)...",
+                     delay, self._backoff_index)
             # Sleep in small increments so SIGTERM is processed promptly
             for _ in range(delay):
                 if self._shutdown:
