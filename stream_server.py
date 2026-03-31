@@ -23,6 +23,10 @@ import os
 import sys
 import time
 import subprocess
+import warnings
+
+# Suppress noisy CUDA/torch warnings when driver is outdated
+warnings.filterwarnings("ignore", message=".*CUDA initialization.*")
 
 import faulthandler
 faulthandler.enable()
