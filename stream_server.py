@@ -274,11 +274,13 @@ class VehicleCounter:
         lx1, ly1 = self.line_start
         lx2, ly2 = self.line_end
 
-        # Detect + track with BoT-SORT on GPU
+        # Detect + track with BoT-SORT (auto device: cuda > mps > cpu)
+        import torch
+        _device = 0 if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
         results = self.model.track(
             frame, verbose=False, conf=self.confidence,
             classes=VEHICLE_CLASSES, persist=True,
-            tracker="botsort_custom.yaml", imgsz=1280, device=0
+            tracker="botsort_custom.yaml", imgsz=1280, device=_device
         )[0]
 
         detections = sv.Detections.from_ultralytics(results)
