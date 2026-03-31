@@ -2,7 +2,7 @@ name: Build Oracle Docker Image
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths: [oracle/**]
   workflow_dispatch:
 
