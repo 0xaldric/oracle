@@ -38,5 +38,5 @@ jobs:
             ghcr.io/${{ env.IMAGE_NAME }}:latest
             ghcr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
           platforms: linux/amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=oracle-v2
+          cache-to: type=gha,mode=max,scope=oracle-v2
