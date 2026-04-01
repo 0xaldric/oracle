@@ -1,0 +1,19 @@
+[Unit]
+Description=Rush Oracle (Full Mode — Stream + Rounds)
+After=network.target
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/home/user/oracle
+Environment=PATH=/home/user/oracle/venv/bin:/home/user/oracle/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
+Environment=NODE_PATH=/home/user/oracle/node_modules
+EnvironmentFile=/home/user/oracle/.env
+ExecStart=/bin/bash /home/user/oracle/run.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
