@@ -585,6 +585,140 @@ def get_stream_url(youtube_url):
     return youtube_url
 
 
+class CloudflareBroadcaster:
+    """Re-streams YOLO-annotated frames to Cloudflare Stream via ffmpeg RTMPS.
+
+    Runs ffmpeg as a subprocess, piping raw BGR frames to stdin.
+    ffmpeg encodes to H.264 and pushes to Cloudflare Live Input.
+
+    Usage:
+        Set these env vars:
+          CF_STREAM_ENABLED=true
+          CF_RTMPS_URL=rtmps://live.cloudflare.com:443/live/
+          CF_STREAM_KEY=<your-stream-key>
+          CF_VIDEO_UID=<your-video-uid>
+    """
+
+    def __init__(self, width=1920, height=1080, fps=8):
+        self.enabled = os.environ.get('CF_STREAM_ENABLED', '').lower() in ('true', '1', 'yes')
+        self.rtmps_url = os.environ.get('CF_RTMPS_URL', 'rtmps://live.cloudflare.com:443/live/')
+        self.stream_key = os.environ.get('CF_STREAM_KEY', '')
+        self.video_uid = os.environ.get('CF_VIDEO_UID', '')
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self._proc = None
+        self._frame_count = 0
+        self._error_count = 0
+        self._MAX_ERRORS = 5  # restart ffmpeg after this many consecutive errors
+
+        if self.enabled and not self.stream_key:
+            print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
+            self.enabled = False
+
+        if self.enabled:
+            print(f"[CF] Cloudflare Stream broadcast enabled")
+            print(f"[CF]   RTMPS: {self.rtmps_url}")
+            print(f"[CF]   Video UID: {self.video_uid}")
+
+    def start(self):
+        """Start ffmpeg subprocess for RTMPS streaming."""
+        if not self.enabled:
+            return
+        self._stop_proc()
+
+        rtmps_dest = f"{self.rtmps_url}{self.stream_key}"
+        cmd = [
+            'ffmpeg',
+            '-y',                       # overwrite
+            '-f', 'rawvideo',           # input format: raw pixels
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',        # OpenCV default: BGR
+            '-s', f'{self.width}x{self.height}',
+            '-r', str(self.fps),        # input fps
+            '-i', '-',                  # read from stdin
+            '-c:v', 'libx264',          # encode H.264
+            '-preset', 'ultrafast',     # low latency
+            '-tune', 'zerolatency',     # no B-frames, low delay
+            '-pix_fmt', 'yuv420p',      # compatible output
+            '-g', str(self.fps * 2),    # keyframe every 2s
+            '-b:v', '2500k',           # bitrate
+            '-maxrate', '3000k',
+            '-bufsize', '6000k',
+            '-f', 'flv',               # FLV container for RTMP
+            rtmps_dest,
+        ]
+
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            self._error_count = 0
+            print(f"[CF] ffmpeg started (pid={self._proc.pid})")
+        except FileNotFoundError:
+            print("[CF] ERROR: ffmpeg not found! Install with: apt install ffmpeg")
+            self.enabled = False
+        except Exception as e:
+            print(f"[CF] ERROR starting ffmpeg: {e}")
+            self.enabled = False
+
+    def send_frame(self, frame):
+        """Send a BGR frame (numpy array) to ffmpeg stdin.
+
+        Automatically resizes to match the configured width/height.
+        Restarts ffmpeg on repeated errors.
+        """
+        if not self.enabled or self._proc is None:
+            return
+        if self._proc.poll() is not None:
+            # ffmpeg died — restart
+            print(f"[CF] ffmpeg exited (code={self._proc.returncode}), restarting...")
+            self.start()
+            if not self.enabled or self._proc is None:
+                return
+
+        try:
+            h, w = frame.shape[:2]
+            if w != self.width or h != self.height:
+                frame = cv2.resize(frame, (self.width, self.height),
+                                   interpolation=cv2.INTER_LINEAR)
+            self._proc.stdin.write(frame.tobytes())
+            self._frame_count += 1
+            self._error_count = 0
+        except (BrokenPipeError, IOError) as e:
+            self._error_count += 1
+            if self._error_count <= 3:
+                print(f"[CF] Write error #{self._error_count}: {e}")
+            if self._error_count >= self._MAX_ERRORS:
+                print(f"[CF] Too many errors, restarting ffmpeg...")
+                self.start()
+
+    def stop(self):
+        """Stop ffmpeg subprocess."""
+        self._stop_proc()
+        if self._frame_count > 0:
+            print(f"[CF] Stopped after {self._frame_count} frames")
+
+    def _stop_proc(self):
+        if self._proc is not None:
+            try:
+                self._proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+
+
 class StreamServer:
     """Persistent WebSocket server that streams processed video frames.
 
@@ -639,6 +773,13 @@ class StreamServer:
                                        min_frames=3)
         self.clients = set()
         self.running = False
+
+        # Cloudflare Stream broadcast (re-stream YOLO frames via ffmpeg → RTMPS)
+        self._cf = CloudflareBroadcaster(
+            width=OUTPUT_WIDTH,
+            height=0,  # will be set on first frame
+            fps=target_fps,
+        )
 
         # Round state — controlled by WS messages
         self._state = self.STATE_IDLE
@@ -773,6 +914,9 @@ class StreamServer:
             "count": self.counter.total_count,
             "cameraId": self.camera_id,
         }
+        # Include Cloudflare videoUid for broadcast fallback mode
+        if self._cf.video_uid:
+            init_msg["videoUid"] = self._cf.video_uid
         if self._round_active:
             init_msg["marketAddress"] = self._round_market
             init_msg["roundId"] = self._round_id
@@ -902,6 +1046,23 @@ class StreamServer:
         print(f"[Stream] Output width: {OUTPUT_WIDTH}px")
         print(f"[STATE] idle — waiting for round")
 
+        # Start Cloudflare broadcast if enabled
+        if self._cf.enabled:
+            # Get actual frame dimensions for ffmpeg
+            ret_test, frame_test = cap.read()
+            if ret_test and frame_test is not None:
+                h_t, w_t = frame_test.shape[:2]
+                if w_t > OUTPUT_WIDTH:
+                    scale = OUTPUT_WIDTH / w_t
+                    out_h = int(h_t * scale)
+                else:
+                    out_h = h_t
+                self._cf.width = OUTPUT_WIDTH
+                self._cf.height = out_h
+                self._cf.start()
+                # Put the test frame back (we don't want to lose it)
+                # We can't un-read it, so we just start from the next frame
+
         self.running = True
         frame_idx = 0
         frame_interval = 1.0 / self.target_fps
@@ -1022,7 +1183,11 @@ class StreamServer:
                 _, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 65])
                 jpeg_bytes = jpeg.tobytes()
 
+                # ── Pipe annotated frame to Cloudflare Stream ────────
+                self._cf.send_frame(annotated)
+
                 # ── Broadcast based on state ─────────────────────────
+                _video_uid_field = {"videoUid": self._cf.video_uid} if self._cf.video_uid else {}
                 if self._round_active:
                     round_elapsed = time.time() - self._round_start_time
                     msg = json.dumps({
@@ -1037,12 +1202,14 @@ class StreamServer:
                         "cameraId": self.camera_id,
                         "roundId": self._round_id,
                         "seq": frame_idx,
+                        **_video_uid_field,
                     })
                 else:
                     msg = json.dumps({
                         "type": "idle",
                         "state": "waiting",
                         "cameraId": self.camera_id,
+                        **_video_uid_field,
                     })
 
                 await self._broadcast(msg, jpeg_bytes)
@@ -1068,6 +1235,7 @@ class StreamServer:
             _reader_alive[0] = False
             if _cap_holder[0] is not None:
                 _cap_holder[0].release()
+            self._cf.stop()
             self.running = False
 
     async def handler(self, ws):
@@ -1126,6 +1294,10 @@ class StreamServer:
         print(f"  Model: {self.counter.model.model_name}")
         print(f"  Mode: persistent (rounds via WS control)")
         print(f"  Target FPS: {self.target_fps}")
+        if self._cf.enabled:
+            print(f"  CF Broadcast: ON (videoUid={self._cf.video_uid})")
+        else:
+            print(f"  CF Broadcast: OFF")
         print(f"{'='*55}\n")
 
         async with websockets.serve(self.handler, self.host, self.port):

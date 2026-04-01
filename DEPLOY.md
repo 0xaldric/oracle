@@ -81,9 +81,49 @@ TARGET_FPS=8                         # Target frames per second
 LEDGER_URL=http://localhost:4000/api # Backend API URL
 LEDGER_API_KEY=...                   # Backend API key (x-api-key header)
 ABLY_API_KEY=...                     # Ably real-time key (keyName:keySecret)
+
+# Cloudflare Stream broadcast (optional)
+CF_STREAM_ENABLED=false              # Set true to enable broadcast mode
+CF_RTMPS_URL=rtmps://live.cloudflare.com:443/live/
+CF_STREAM_KEY=...                    # Cloudflare Live Input stream key
+CF_VIDEO_UID=...                     # Cloudflare video UID (sent to frontend)
 ```
 
-### 7. Install systemd service
+### 7. Setup Cloudflare Stream broadcast (optional)
+
+Broadcast mode cho phép frontend fallback sang Cloudflare CDN khi không nhận được JPEG frames từ WebSocket.
+
+```bash
+# 1. Tạo Live Input trên Cloudflare Dashboard:
+#    dash.cloudflare.com → Stream → Live Inputs → Create
+#    Hoặc qua API:
+curl -X POST "https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/stream/live_inputs" \
+  -H "Authorization: Bearer {CF_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"meta":{"name":"rush-oracle"},"recording":{"mode":"off"}}'
+
+# Response sẽ chứa:
+#   uid          → CF_VIDEO_UID (gửi cho frontend)
+#   rtmps.url    → CF_RTMPS_URL
+#   rtmps.streamKey → CF_STREAM_KEY
+
+# 2. Install ffmpeg (nếu chưa có):
+sudo apt install -y ffmpeg
+
+# 3. Thêm vào .env:
+echo 'CF_STREAM_ENABLED=true' >> .env
+echo 'CF_RTMPS_URL=rtmps://live.cloudflare.com:443/live/' >> .env
+echo 'CF_STREAM_KEY=your-stream-key' >> .env
+echo 'CF_VIDEO_UID=your-video-uid' >> .env
+
+# 4. Restart oracle:
+sudo systemctl restart rush-oracle
+```
+
+Frontend sẽ nhận `videoUid` trong mọi WebSocket message và dùng nó để build Cloudflare iframe URL:
+`https://customer-vn9syvcedwumw0ut.cloudflarestream.com/{videoUid}/iframe`
+
+### 8. Install systemd service
 
 ```bash
 sudo cp rush-oracle-full.service /etc/systemd/system/rush-oracle.service
