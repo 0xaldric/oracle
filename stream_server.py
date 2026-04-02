@@ -588,6 +588,222 @@ def get_stream_url(youtube_url, force_refresh=False):
     return youtube_url
 
 
+def _is_youtube_url(url):
+    return 'youtube.com' in url or 'youtu.be' in url
+
+
+class StreamlinkPipe:
+    """Reads frames from a live stream using streamlink → ffmpeg pipe.
+
+    Instead of yt-dlp extracting a URL and cv2.VideoCapture opening it,
+    we pipe: streamlink (HLS fetch + buffer) → ffmpeg (decode to raw BGR) → numpy frames.
+
+    Benefits:
+    - streamlink handles HLS segment fetching, buffering, and reconnects internally
+    - ffmpeg decodes reliably via pipe (no cv2 HLS quirks)
+    - ~2min buffer gives smooth playback even with network hiccups
+    - No stale URL issues — streamlink resolves URLs on its own
+    """
+
+    def __init__(self, stream_url, width=1280, quality='best'):
+        self._stream_url = stream_url
+        self._width = width
+        self._quality = quality
+        self._proc = None      # streamlink | ffmpeg pipeline
+        self._frame_size = None
+        self._frame_h = 0
+        self._frame_w = 0
+
+    def _find_streamlink(self):
+        """Find streamlink binary."""
+        import shutil
+        sl = shutil.which('streamlink')
+        if sl:
+            return sl
+        # Check common local paths
+        for p in [os.path.expanduser('~/.local/bin/streamlink'), '/usr/local/bin/streamlink']:
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def start(self):
+        """Start the streamlink → ffmpeg pipeline. Returns (width, height, fps)."""
+        self.stop()
+
+        sl_bin = self._find_streamlink()
+        if sl_bin is None:
+            raise RuntimeError("streamlink not found — install with: pip install streamlink")
+
+        is_yt = _is_youtube_url(self._stream_url)
+
+        # Step 1: Probe stream resolution with a quick streamlink → ffprobe
+        print(f"[Streamlink] Probing stream: {self._stream_url[:60]}...")
+        probe_w, probe_h, probe_fps = self._probe_stream(sl_bin, is_yt)
+        if probe_w == 0:
+            # Fallback defaults
+            probe_w, probe_h, probe_fps = 1280, 720, 30
+            print(f"[Streamlink] Probe failed, using defaults: {probe_w}x{probe_h} @ {probe_fps}fps")
+
+        # Scale to output width
+        if probe_w > self._width:
+            scale_factor = self._width / probe_w
+            out_w = self._width
+            out_h = int(probe_h * scale_factor)
+            # Ensure even dimensions for ffmpeg
+            out_h = out_h if out_h % 2 == 0 else out_h + 1
+        else:
+            out_w = probe_w
+            out_h = probe_h
+
+        self._frame_w = out_w
+        self._frame_h = out_h
+        self._frame_size = out_w * out_h * 3  # BGR24
+
+        # Step 2: Build streamlink → ffmpeg pipe
+        # streamlink outputs raw MPEG-TS to stdout
+        sl_cmd = [sl_bin, '--stdout']
+        if is_yt:
+            sl_cmd += ['--plugin-dirs', '/dev/null']  # use built-in YouTube plugin
+        sl_cmd += [
+            '--stream-segment-threads', '3',
+            '--hls-live-edge', '6',         # buffer ~6 segments (~12-18s)
+            '--retry-streams', '5',          # retry every 5s if stream dies
+            '--retry-max', '0',              # retry forever
+            '--retry-open', '5',             # retry opening 5 times
+            self._stream_url,
+            self._quality,
+        ]
+
+        # ffmpeg reads from stdin, outputs raw BGR24 frames to stdout
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-loglevel', 'warning',
+            '-i', 'pipe:0',                 # read from stdin (streamlink output)
+            '-vf', f'scale={out_w}:{out_h}',
+            '-pix_fmt', 'bgr24',
+            '-f', 'rawvideo',
+            '-an',                           # drop audio
+            'pipe:1',                        # output raw frames to stdout
+        ]
+
+        print(f"[Streamlink] Starting pipe: {out_w}x{out_h} @ {probe_fps}fps")
+        print(f"[Streamlink] CMD: {' '.join(sl_cmd[:6])}... | ffmpeg ...")
+
+        # Launch: streamlink stdout → ffmpeg stdin → our stdout
+        sl_proc = subprocess.Popen(
+            sl_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=1024*1024,  # 1MB buffer
+        )
+
+        ff_proc = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=sl_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=self._frame_size * 2,  # buffer 2 frames
+        )
+
+        # Allow streamlink to receive SIGPIPE if ffmpeg dies
+        sl_proc.stdout.close()
+
+        self._sl_proc = sl_proc
+        self._proc = ff_proc
+
+        print(f"[Streamlink] Pipeline started (sl pid={sl_proc.pid}, ff pid={ff_proc.pid})")
+        return out_w, out_h, probe_fps
+
+    def _probe_stream(self, sl_bin, is_yt):
+        """Quick probe to get stream dimensions and FPS."""
+        try:
+            sl_cmd = [sl_bin, '--stdout']
+            if is_yt:
+                sl_cmd += ['--plugin-dirs', '/dev/null']
+            sl_cmd += [self._stream_url, self._quality]
+
+            probe_cmd = [
+                'ffprobe',
+                '-loglevel', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height,r_frame_rate',
+                '-of', 'csv=p=0',
+                '-i', 'pipe:0',
+            ]
+
+            sl = subprocess.Popen(sl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            ff = subprocess.Popen(probe_cmd, stdin=sl.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            sl.stdout.close()
+
+            out, _ = ff.communicate(timeout=30)
+            sl.terminate()
+            sl.wait(timeout=5)
+
+            if out:
+                # ffprobe may output multiple lines — take the last valid one
+                import re
+                text = out.decode().strip()
+                # Match pattern like "1920,1080,30/1" or "1280,720,25"
+                match = re.search(r'(\d+),(\d+),(\d+(?:/\d+)?)', text)
+                if match:
+                    w = int(match.group(1))
+                    h = int(match.group(2))
+                    fps_str = match.group(3)
+                    if '/' in fps_str:
+                        num, den = fps_str.split('/')
+                        fps = int(num) / max(int(den), 1)
+                    else:
+                        fps = float(fps_str)
+                    print(f"[Streamlink] Probed: {w}x{h} @ {fps:.1f}fps")
+                    return w, h, fps
+        except Exception as e:
+            print(f"[Streamlink] Probe error: {e}")
+
+        return 0, 0, 30
+
+    def read(self):
+        """Read one BGR frame. Returns (success, frame) like cv2.VideoCapture.read()."""
+        if self._proc is None or self._proc.poll() is not None:
+            return False, None
+
+        try:
+            raw = self._proc.stdout.read(self._frame_size)
+            if len(raw) != self._frame_size:
+                return False, None
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                (self._frame_h, self._frame_w, 3)
+            ).copy()  # writable copy — cv2 needs mutable arrays for drawing
+            return True, frame
+        except Exception:
+            return False, None
+
+    def stop(self):
+        """Kill the pipeline."""
+        for proc_attr in ('_proc', '_sl_proc'):
+            proc = getattr(self, proc_attr, None)
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                setattr(self, proc_attr, None)
+
+    def isOpened(self):
+        return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def width(self):
+        return self._frame_w
+
+    @property
+    def height(self):
+        return self._frame_h
+
+
 class CloudflareBroadcaster:
     """Re-streams YOLO-annotated frames to Cloudflare Stream via ffmpeg RTMPS.
 
@@ -1120,16 +1336,25 @@ class StreamServer:
 
     def _run_video_pipeline(self, loop, _queue):
         """Single run of the video pipeline. Raises on error for auto-restart."""
-        direct_url = get_stream_url(self.stream_url)
+        use_streamlink = _is_youtube_url(self.stream_url)
+        _sl_pipe = [None]  # StreamlinkPipe reference for reader thread
 
-        print(f"\n[Stream] Opening video...")
-        cap = cv2.VideoCapture(direct_url)
-
-        if not cap.isOpened():
-            print("[ERROR] Could not open video stream!")
-            raise RuntimeError("Could not open video stream")
-
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        if use_streamlink:
+            print(f"\n[Stream] Opening via streamlink pipe...")
+            sl = StreamlinkPipe(self.stream_url, width=OUTPUT_WIDTH)
+            out_w, out_h, fps = sl.start()
+            _sl_pipe[0] = sl
+            # Read first frame to init CF broadcast
+            cap = None  # no cv2 cap
+        else:
+            direct_url = get_stream_url(self.stream_url)
+            print(f"\n[Stream] Opening video (direct HLS)...")
+            cap = cv2.VideoCapture(direct_url)
+            if not cap.isOpened():
+                print("[ERROR] Could not open video stream!")
+                raise RuntimeError("Could not open video stream")
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            _sl_pipe[0] = None
 
         print(f"[Stream] Opened. FPS: {fps:.0f}")
         print(f"[Stream] Output width: {OUTPUT_WIDTH}px")
@@ -1137,17 +1362,25 @@ class StreamServer:
 
         # Start Cloudflare broadcast if enabled
         if self._cf.enabled:
-            ret_test, frame_test = cap.read()
-            if ret_test and frame_test is not None:
-                h_t, w_t = frame_test.shape[:2]
-                if w_t > OUTPUT_WIDTH:
-                    scale = OUTPUT_WIDTH / w_t
-                    out_h = int(h_t * scale)
-                else:
-                    out_h = h_t
-                self._cf.width = OUTPUT_WIDTH
-                self._cf.height = out_h
-                self._cf.start()
+            if use_streamlink:
+                sl_ref = _sl_pipe[0]
+                ret_test, frame_test = sl_ref.read()
+                if ret_test and frame_test is not None:
+                    self._cf.width = sl_ref.width
+                    self._cf.height = sl_ref.height
+                    self._cf.start()
+            else:
+                ret_test, frame_test = cap.read()
+                if ret_test and frame_test is not None:
+                    h_t, w_t = frame_test.shape[:2]
+                    if w_t > OUTPUT_WIDTH:
+                        scale = OUTPUT_WIDTH / w_t
+                        out_h = int(h_t * scale)
+                    else:
+                        out_h = h_t
+                    self._cf.width = OUTPUT_WIDTH
+                    self._cf.height = out_h
+                    self._cf.start()
 
         self.running = True
         frame_idx = 0
@@ -1158,7 +1391,7 @@ class StreamServer:
         import threading
         _frame_q = _queue.Queue(maxsize=2)
         _reader_alive = [True]
-        _cap_holder = [cap]
+        _cap_holder = [cap]         # cv2.VideoCapture (HLS direct) or None
         _last_frame_time = [time.time()]
         self._switch_event = threading.Event()
 
@@ -1166,60 +1399,102 @@ class StreamServer:
 
         def _reader():
             while _reader_alive[0]:
+                # ── Camera switch handling ──
                 if self._switch_event.is_set():
                     self._switch_event.clear()
                     _force_refresh[0] = True
                     print("[Reader] Camera switch — reconnecting to new stream...")
+                    # Kill existing streamlink pipe
+                    if _sl_pipe[0] is not None:
+                        _sl_pipe[0].stop()
+                        _sl_pipe[0] = None
+                    # Kill existing cv2 cap
                     try:
                         c = _cap_holder[0]
                         if c is not None:
                             c.release()
                     except Exception:
                         pass
+                    _cap_holder[0] = None
                     while not _frame_q.empty():
                         try:
                             _frame_q.get_nowait()
                         except _queue.Empty:
                             break
-                    _cap_holder[0] = None
 
-                c = _cap_holder[0]
-                if c is None or not c.isOpened():
-                    print("[Reader] Reconnecting...")
-                    try:
-                        if c is not None:
-                            c.release()
-                        new_url = get_stream_url(self.stream_url, force_refresh=_force_refresh[0])
-                        _force_refresh[0] = False
-                        new_cap = cv2.VideoCapture(new_url)
-                        # Set timeouts to prevent blocking forever on bad streams
-                        new_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)
-                        new_cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
-                        _cap_holder[0] = new_cap
-                        _last_frame_time[0] = time.time()
-                        print("[Reader] Reconnected")
-                    except Exception as e:
-                        print(f"[Reader] Error: {e}")
-                        time.sleep(2)
-                    continue
+                # ── Determine mode: streamlink or cv2 ──
+                is_yt = _is_youtube_url(self.stream_url)
 
-                ret, f = c.read()
-                if ret and f is not None:
-                    _last_frame_time[0] = time.time()
-                    try:
-                        _frame_q.put(f, timeout=1)
-                    except _queue.Full:
-                        pass
-                else:
-                    if time.time() - _last_frame_time[0] > 5:
-                        print("[Reader] No frames 5s — forcing reconnect")
+                if is_yt:
+                    # === Streamlink pipe mode ===
+                    sl = _sl_pipe[0]
+                    if sl is None or not sl.isOpened():
+                        print("[Reader] Starting streamlink pipe...")
+                        if sl is not None:
+                            sl.stop()
                         try:
-                            c.release()
-                        except Exception:
+                            new_sl = StreamlinkPipe(self.stream_url, width=OUTPUT_WIDTH)
+                            new_sl.start()
+                            _sl_pipe[0] = new_sl
+                            _last_frame_time[0] = time.time()
+                            print("[Reader] Streamlink pipe ready")
+                        except Exception as e:
+                            print(f"[Reader] Streamlink error: {e}")
+                            time.sleep(3)
+                        continue
+
+                    ret, f = sl.read()
+                    if ret and f is not None:
+                        _last_frame_time[0] = time.time()
+                        try:
+                            _frame_q.put(f, timeout=1)
+                        except _queue.Full:
                             pass
-                        _cap_holder[0] = None
                     else:
-                        time.sleep(0.02)
+                        if time.time() - _last_frame_time[0] > 10:
+                            print("[Reader] Streamlink no frames 10s — restarting pipe")
+                            sl.stop()
+                            _sl_pipe[0] = None
+                        else:
+                            time.sleep(0.02)
+                else:
+                    # === Direct HLS / cv2 mode (non-YouTube) ===
+                    c = _cap_holder[0]
+                    if c is None or not c.isOpened():
+                        print("[Reader] Reconnecting (direct HLS)...")
+                        try:
+                            if c is not None:
+                                c.release()
+                            new_url = get_stream_url(self.stream_url, force_refresh=_force_refresh[0])
+                            _force_refresh[0] = False
+                            new_cap = cv2.VideoCapture(new_url)
+                            new_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)
+                            new_cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+                            _cap_holder[0] = new_cap
+                            _last_frame_time[0] = time.time()
+                            print("[Reader] Reconnected")
+                        except Exception as e:
+                            print(f"[Reader] Error: {e}")
+                            time.sleep(2)
+                        continue
+
+                    ret, f = c.read()
+                    if ret and f is not None:
+                        _last_frame_time[0] = time.time()
+                        try:
+                            _frame_q.put(f, timeout=1)
+                        except _queue.Full:
+                            pass
+                    else:
+                        if time.time() - _last_frame_time[0] > 5:
+                            print("[Reader] No frames 5s — forcing reconnect")
+                            try:
+                                c.release()
+                            except Exception:
+                                pass
+                            _cap_holder[0] = None
+                        else:
+                            time.sleep(0.02)
 
         threading.Thread(target=_reader, daemon=True).start()
 
@@ -1380,7 +1655,12 @@ class StreamServer:
         finally:
             _reader_alive[0] = False
             if _cap_holder[0] is not None:
-                _cap_holder[0].release()
+                try:
+                    _cap_holder[0].release()
+                except Exception:
+                    pass
+            if _sl_pipe[0] is not None:
+                _sl_pipe[0].stop()
             self._cf.stop()
 
     async def handler(self, ws):
