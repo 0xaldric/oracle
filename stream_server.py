@@ -1007,8 +1007,8 @@ class CloudflareBroadcaster:
                 new_count = 0
                 hold_count = 0
                 # pop_rate: fraction of frames popped per write.
-                # 6fps YOLO input / 45fps output = 0.133 (pop 1 every ~7.5 writes)
-                pop_rate = 6.0 / cfps
+                # ~15fps YOLO input / 45fps output = 0.333 (pop 1 every ~3 writes)
+                pop_rate = 15.0 / cfps
                 pop_accum = 0.0
                 next_time = time.monotonic()
                 last_log = time.monotonic()
