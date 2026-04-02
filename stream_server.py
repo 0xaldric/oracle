@@ -1018,12 +1018,18 @@ class StreamServer:
         dead = set()
         async def send_to(ws):
             try:
-                await asyncio.wait_for(ws.send(json_msg), timeout=2)
-                await asyncio.wait_for(ws.send(jpeg_bytes), timeout=2)
-            except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError):
+                await asyncio.wait_for(ws.send(json_msg), timeout=1)
+                await asyncio.wait_for(ws.send(jpeg_bytes), timeout=1)
+            except Exception:
                 dead.add(ws)
-        await asyncio.gather(*(send_to(ws) for ws in self.clients))
-        self.clients -= dead
+        await asyncio.gather(*(send_to(ws) for ws in list(self.clients)))
+        if dead:
+            self.clients -= dead
+            for ws in dead:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
 
     async def _broadcast_json(self, msg):
         """Send JSON-only message to all clients."""
@@ -1033,11 +1039,17 @@ class StreamServer:
         dead = set()
         async def send_to(ws):
             try:
-                await asyncio.wait_for(ws.send(raw), timeout=2)
-            except (websockets.exceptions.ConnectionClosed, asyncio.TimeoutError):
+                await asyncio.wait_for(ws.send(raw), timeout=1)
+            except Exception:
                 dead.add(ws)
-        await asyncio.gather(*(send_to(ws) for ws in self.clients))
-        self.clients -= dead
+        await asyncio.gather(*(send_to(ws) for ws in list(self.clients)))
+        if dead:
+            self.clients -= dead
+            for ws in dead:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
 
     def _ensure_evidence_dir(self) -> None:
         """Create evidence/ directory and clean up old evidence if needed."""
