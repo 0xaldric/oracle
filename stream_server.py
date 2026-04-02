@@ -29,6 +29,16 @@ import threading
 import faulthandler
 faulthandler.enable()
 
+# Load .env file if present (no dependency needed)
+_env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+if os.path.isfile(_env_file):
+    with open(_env_file) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith('#') and '=' in _line:
+                _k, _v = _line.split('=', 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 try:
     import cv2
     import numpy as np
