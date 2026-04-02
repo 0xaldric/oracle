@@ -882,9 +882,9 @@ class CloudflareBroadcaster:
         self._frame_count = 0
         self._writer_thread = None
         self._alive = False
-        # Large queue: main loop pushes ~12fps, CF writer reads smoothly.
-        # CF can be up to 2 min behind real-time but always smooth.
-        self._frame_q = queue.Queue(maxsize=1500)  # ~2 min at 12fps input
+        # Large queue: YOLO pushes ~6fps, CF writer reads smoothly.
+        # CF can be up to 5 min behind real-time but always smooth.
+        self._frame_q = queue.Queue(maxsize=1800)  # ~5 min at 6fps YOLO
 
         if self.enabled and not self.stream_key:
             print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
@@ -988,7 +988,7 @@ class CloudflareBroadcaster:
             # pop_rate adapts to keep queue at TARGET_Q depth.
             # Result: perfectly smooth 45fps, content updates ~12fps evenly.
             self._alive = True
-            TARGET_Q = 360       # target queue depth (~30s at 12fps)
+            TARGET_Q = 1080      # target queue depth (~3 min at 6fps YOLO)
             def _cf_writer():
                 proc = self._proc
                 fq = self._frame_q
@@ -998,8 +998,8 @@ class CloudflareBroadcaster:
                 new_count = 0
                 hold_count = 0
                 # pop_rate: fraction of frames popped per write.
-                # 30fps input / 45fps output = 0.667 (pop 1 every ~1.5 writes)
-                pop_rate = 30.0 / cfps
+                # 6fps YOLO input / 45fps output = 0.133 (pop 1 every ~7.5 writes)
+                pop_rate = 6.0 / cfps
                 pop_accum = 0.0
                 next_time = time.monotonic()
                 last_log = time.monotonic()
@@ -1665,21 +1665,7 @@ class StreamServer:
                     f = np.frombuffer(raw, dtype=np.uint8).reshape(
                         (frame_h[0], OUTPUT_WIDTH, 3)).copy()
 
-                    # Push frame to CF queue directly (30fps, bypasses main loop).
-                    # Overlay latest YOLO result if available.
-                    if self._cf.enabled and self._cf._proc is not None:
-                        cf_frame = f
-                        with _yolo_lock:
-                            yr = _yolo_result[0]
-                        if yr is not None and yr.shape == f.shape:
-                            if self._roi_mask is not None:
-                                roi_inv = cv2.bitwise_not(self._roi_mask)
-                                bg = cv2.bitwise_and(f, roi_inv)
-                                fg = cv2.bitwise_and(yr, self._roi_mask)
-                                cf_frame = cv2.add(bg, fg)
-                            else:
-                                cf_frame = yr
-                        self._cf.send_frame(cf_frame)
+                    # CF is now fed from YOLO worker (not reader)
 
                     # Replace whatever is in the main loop queue with latest frame
                     while not _frame_q.empty():
@@ -1719,11 +1705,24 @@ class StreamServer:
                 with _yolo_lock:
                     _yolo_result[0] = annotated
                     _yolo_result[1] = cnt
+
+                # Push YOLO-annotated frame to CF queue.
+                # Composite with ROI if needed, then send.
+                if self._cf.enabled and self._cf._proc is not None:
+                    cf_frame = annotated
+                    if annotated.shape == yf.shape and self._roi_mask is not None:
+                        roi_inv = cv2.bitwise_not(self._roi_mask)
+                        bg = cv2.bitwise_and(yf, roi_inv)
+                        fg = cv2.bitwise_and(annotated, self._roi_mask)
+                        cf_frame = cv2.add(bg, fg)
+                    self._cf.send_frame(cf_frame)
+
                 _yolo_frame_id[0] += 1
                 now = time.monotonic()
                 if now - _yolo_last_log[0] >= 5.0:
                     _yolo_last_log[0] = now
-                    print(f"[YOLO] frame={_yolo_frame_id[0]} infer={yolo_ms:.0f}ms count={cnt}")
+                    cfq = self._cf._frame_q.qsize() if self._cf.enabled else 0
+                    print(f"[YOLO] frame={_yolo_frame_id[0]} infer={yolo_ms:.0f}ms count={cnt} cfq={cfq}")
 
         threading.Thread(target=_yolo_worker, daemon=True).start()
 
