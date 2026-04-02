@@ -1626,6 +1626,7 @@ class StreamServer:
         # YOLO inference thread
         _yolo_q = _queue.Queue(maxsize=1)
         _yolo_result = [None, 0]
+        _yolo_overlay = [None]  # Latest YOLO overlay (annotations only, transparent bg)
         _yolo_lock = threading.Lock()
 
         def _yolo_worker():
@@ -1636,9 +1637,19 @@ class StreamServer:
                     continue
                 yolo_input = self.apply_roi(yf)
                 annotated, cnt = self.counter.process_frame(yolo_input)
+
+                # Extract annotation overlay by diffing annotated vs input
+                # Pixels where annotated differs from input = annotations
+                diff_mask = cv2.absdiff(annotated, yolo_input)
+                diff_gray = cv2.cvtColor(diff_mask, cv2.COLOR_BGR2GRAY)
+                _, overlay_mask = cv2.threshold(diff_gray, 5, 255, cv2.THRESH_BINARY)
+                # Dilate to cover anti-aliased edges
+                overlay_mask = cv2.dilate(overlay_mask, None, iterations=1)
+
                 with _yolo_lock:
                     _yolo_result[0] = annotated
                     _yolo_result[1] = cnt
+                    _yolo_overlay[0] = (annotated, overlay_mask)
 
         threading.Thread(target=_yolo_worker, daemon=True).start()
 
@@ -1693,21 +1704,23 @@ class StreamServer:
                 except _queue.Full:
                     pass
 
-                # Use latest YOLO result
+                # Use latest YOLO result — hybrid overlay approach:
+                # Raw video stays at 30fps (smooth), YOLO annotations overlay on top (~3fps update)
                 with _yolo_lock:
-                    annotated = _yolo_result[0] if _yolo_result[0] is not None else frame
                     count = _yolo_result[1]
+                    overlay_data = _yolo_overlay[0]  # (annotated_frame, mask) or None
 
-                # Composite
-                if annotated is not frame and annotated.shape == frame.shape:
-                    if self._roi_mask is not None:
-                        roi_inv = cv2.bitwise_not(self._roi_mask)
-                        bg = cv2.bitwise_and(frame, roi_inv)
-                        fg = cv2.bitwise_and(annotated, self._roi_mask)
-                        annotated = cv2.add(bg, fg)
-                    display = annotated
-                else:
-                    display = frame
+                # Composite: copy YOLO annotation pixels onto raw frame
+                display = frame.copy()
+                if overlay_data is not None:
+                    ovl_frame, ovl_mask = overlay_data
+                    if ovl_frame.shape == frame.shape:
+                        if self._roi_mask is not None:
+                            # Only apply overlay within ROI
+                            combined_mask = cv2.bitwise_and(ovl_mask, self._roi_mask[:, :, 0] if len(self._roi_mask.shape) == 3 else self._roi_mask)
+                            np.copyto(display, ovl_frame, where=combined_mask[:, :, np.newaxis] > 0)
+                        else:
+                            np.copyto(display, ovl_frame, where=ovl_mask[:, :, np.newaxis] > 0)
 
                 # Broadcast vehicle_counted events
                 if self._round_active and hasattr(self, '_pending_vehicle_events'):
