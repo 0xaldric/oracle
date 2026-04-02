@@ -890,9 +890,9 @@ class CloudflareBroadcaster:
         self._frame_count = 0
         self._writer_thread = None
         self._alive = False
-        # Large queue: YOLO pushes ~6fps, CF writer reads smoothly.
-        # CF can be up to 5 min behind real-time but always smooth.
-        self._frame_q = queue.Queue(maxsize=1800)  # ~5 min at 6fps YOLO
+        # Single-slot: always show latest frame. Simple, never blocks.
+        self._latest = None
+        self._latest_lock = threading.Lock()
 
         if self.enabled and not self.stream_key:
             print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
@@ -986,94 +986,31 @@ class CloudflareBroadcaster:
             except Exception as e:
                 print(f"[CF] pipe buffer resize failed (ok): {e}")
 
-            # Writer thread: pops YOLO frames from queue, repeats each to fill 30fps.
-            # Uses monotonic clock to maintain exact 30fps pace.
-            # write() may block (pipe full) — that's fine, clock catches up after.
-            # Queue buffers ~30s of YOLO frames for resilience.
-            # Queue-based writer with fractional rate matching.
-            # Main loop pushes ~12fps. Writer outputs 45fps.
-            # Uses a float accumulator to pop frames at exact input rate.
-            # pop_rate adapts to keep queue at TARGET_Q depth.
-            # Result: perfectly smooth 45fps, content updates ~12fps evenly.
+            # Simple single-slot writer: always show latest frame at 45fps.
+            # No queue, no buffering, no adaptation. Just grab latest + write.
+            # If write blocks (RTMPS stall), clock catches up after unblock.
             self._alive = True
-            TARGET_Q = 1080      # target queue depth (~3 min at 6fps YOLO)
-            MIN_Q_START = 360    # don't start playing until queue has 1 min buffer
             def _cf_writer():
                 proc = self._proc
-                fq = self._frame_q
                 interval = 1.0 / cfps
                 current = None
                 frame_n = 0
-                new_count = 0
-                hold_count = 0
-                # pop_rate: fraction of frames popped per write.
-                # ~10fps YOLO input / 45fps output = 0.222 (pop 1 every ~4.5 writes)
-                pop_rate = 10.0 / cfps
-                pop_accum = 0.0
                 next_time = time.monotonic()
                 last_log = time.monotonic()
-                last_adjust = time.monotonic()
-                buffering = True
-
+                new_count = 0
                 try:
-                    # Phase 1: Buffer — wait until queue has MIN_Q_START frames
-                    print(f"[CF Writer] buffering... waiting for {MIN_Q_START} frames")
-                    while proc and proc.poll() is None and self._alive and buffering:
-                        qs = fq.qsize()
-                        if qs >= MIN_Q_START:
-                            buffering = False
-                            print(f"[CF Writer] buffer ready ({qs} frames), starting playback")
-                            break
-                        # Feed a black/hold frame to keep ffmpeg alive
-                        if current is None:
-                            try:
-                                current = fq.get(timeout=1)
-                                new_count += 1
-                            except queue.Empty:
-                                continue
-                        now = time.monotonic()
-                        wait = next_time - now
-                        if wait > 0:
-                            time.sleep(wait)
-                        next_time += interval
-                        if time.monotonic() - next_time > 1.0:
-                            next_time = time.monotonic()
-                        try:
-                            proc.stdin.write(current)
-                            frame_n += 1
-                        except (BrokenPipeError, IOError) as e:
-                            print(f"[CF Writer] pipe error during buffer: {e}")
-                            break
-                        # Log during buffering
-                        now_m = time.monotonic()
-                        if now_m - last_log >= 5.0:
-                            last_log = now_m
-                            print(f"[CF Writer] buffering... q={qs}/{MIN_Q_START}")
-
-                    # Phase 2: Playback — smooth adaptive consumption
-                    next_time = time.monotonic()
                     while proc and proc.poll() is None and self._alive:
-                        # Fractional pop: accumulate and pop when >= 1.0
-                        pop_accum += pop_rate
-                        if pop_accum >= 1.0:
-                            pop_accum -= 1.0
-                            try:
-                                current = fq.get_nowait()
-                                new_count += 1
-                            except queue.Empty:
-                                pop_accum = 0.0
-                                hold_count += 1
-                                if current is None:
-                                    time.sleep(0.03)
-                                    next_time = time.monotonic()
-                                    continue
-                        elif current is None:
-                            try:
-                                current = fq.get(timeout=0.1)
-                                new_count += 1
-                            except queue.Empty:
-                                continue
-                        # Wait until next frame time
+                        # Grab latest frame
+                        with self._latest_lock:
+                            got = self._latest
+                        if got is not None and got is not current:
+                            current = got
+                            new_count += 1
+                        if current is None:
+                            time.sleep(0.02)
+                            next_time = time.monotonic()
+                            continue
+                        # Pace at 45fps
                         now = time.monotonic()
                         wait = next_time - now
                         if wait > 0:
@@ -1087,26 +1024,15 @@ class CloudflareBroadcaster:
                         except (BrokenPipeError, IOError) as e:
                             print(f"[CF Writer] pipe error: {e}")
                             break
-                        # Adapt pop_rate every 2s based on queue depth
-                        now_m = time.monotonic()
-                        if now_m - last_adjust >= 2.0:
-                            last_adjust = now_m
-                            qs = fq.qsize()
-                            if qs > TARGET_Q + 30:
-                                pop_rate = min(0.5, pop_rate + 0.005)   # consume faster
-                            elif qs < TARGET_Q - 30:
-                                pop_rate = max(0.05, pop_rate - 0.005)  # consume slower
                         # Debug every 10s
+                        now_m = time.monotonic()
                         if now_m - last_log >= 10.0:
                             last_log = now_m
-                            qs = fq.qsize()
-                            ufps = new_count / 10.0
-                            print(f"[CF Writer] frames={frame_n} new={new_count}({ufps:.1f}fps) hold={hold_count} q={qs} rate={pop_rate:.3f}")
+                            print(f"[CF Writer] frames={frame_n} new={new_count}")
                             new_count = 0
-                            hold_count = 0
                 except Exception as e:
                     print(f"[CF Writer] FATAL: {e}")
-                print(f"[CF Writer] exiting (wrote {frame_n} frames, q={fq.qsize()})")
+                print(f"[CF Writer] exiting (wrote {frame_n} frames)")
             self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
             self._writer_thread.start()
         except FileNotFoundError:
@@ -1141,10 +1067,8 @@ class CloudflareBroadcaster:
             frame = cv2.resize(frame, (self._cf_w, self._cf_h),
                                interpolation=cv2.INTER_LINEAR)
         data = frame.tobytes()
-        try:
-            self._frame_q.put_nowait(data)
-        except queue.Full:
-            pass  # queue full — oldest frames stay, newest dropped
+        with self._latest_lock:
+            self._latest = data
         self._frame_count += 1
 
     def stop(self):
@@ -1155,11 +1079,8 @@ class CloudflareBroadcaster:
 
     def _stop_proc(self):
         self._alive = False
-        while not self._frame_q.empty():
-            try:
-                self._frame_q.get_nowait()
-            except queue.Empty:
-                break
+        with self._latest_lock:
+            self._latest = None
         if self._proc is not None:
             try:
                 self._proc.stdin.close()
@@ -1767,8 +1688,7 @@ class StreamServer:
                 now = time.monotonic()
                 if now - _yolo_last_log[0] >= 5.0:
                     _yolo_last_log[0] = now
-                    cfq = self._cf._frame_q.qsize() if self._cf.enabled else 0
-                    print(f"[YOLO] frame={_yolo_frame_id[0]} infer={yolo_ms:.0f}ms count={cnt} cfq={cfq}")
+                    print(f"[YOLO] frame={_yolo_frame_id[0]} infer={yolo_ms:.0f}ms count={cnt}")
 
         threading.Thread(target=_yolo_worker, daemon=True).start()
 
