@@ -963,25 +963,35 @@ class CloudflareBroadcaster:
             self._error_count = 0
             print(f"[CF] ffmpeg started (pid={self._proc.pid})")
 
-            # Start async writer thread — reads frames from queue and writes to ffmpeg stdin
-            # Reader thread feeds raw frames at source fps (30fps) for smooth CF stream
+            # Start async writer thread — repeats latest YOLO frame at target fps
+            # YOLO produces ~3fps but we repeat to fill 30fps for smooth playback
             self._write_q = queue.Queue(maxsize=2)
             def _cf_writer():
                 proc = self._proc
                 wq = self._write_q
+                current_frame = None
+                interval = 1.0 / self.fps
                 while proc and proc.poll() is None and wq is not None:
+                    t0 = time.time()
+                    # Pick up latest YOLO frame if available
                     try:
-                        data = wq.get(timeout=1)
+                        current_frame = wq.get_nowait()
                     except queue.Empty:
+                        pass
+                    if current_frame is None:
+                        time.sleep(interval)
                         continue
                     try:
-                        proc.stdin.write(data)
+                        proc.stdin.write(current_frame)
                     except (BrokenPipeError, IOError) as e:
                         print(f"[CF Writer] pipe error: {e}")
                         break
                     except Exception as e:
                         print(f"[CF Writer] unexpected error: {e}")
                         break
+                    elapsed = time.time() - t0
+                    if elapsed < interval:
+                        time.sleep(interval - elapsed)
                 print("[CF Writer] thread exiting")
             self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
             self._writer_thread.start()
@@ -1595,20 +1605,6 @@ class StreamServer:
                     f = np.frombuffer(raw, dtype=np.uint8).reshape(
                         (frame_h[0], OUTPUT_WIDTH, 3)).copy()
 
-                    # Feed raw frame to CF at source fps (smooth 30fps)
-                    if self._cf.enabled and self._cf._write_q is not None:
-                        try:
-                            data = f.tobytes()
-                            # Drop old, keep latest
-                            while not self._cf._write_q.empty():
-                                try:
-                                    self._cf._write_q.get_nowait()
-                                except _queue.Empty:
-                                    break
-                            self._cf._write_q.put_nowait(data)
-                        except Exception:
-                            pass
-
                     # Replace whatever is in the queue with latest frame
                     while not _frame_q.empty():
                         try:
@@ -1732,8 +1728,8 @@ class StreamServer:
                 cv2.putText(display, dbg, (w_d - 420, h_d - 8),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 136), 1)
 
-                # CF is now fed directly from reader thread at source fps
-                # (smooth 30fps without YOLO bottleneck)
+                # Pipe YOLO-annotated frame to Cloudflare Stream
+                self._cf.send_frame(display)
 
                 # WS: JSON-only state updates at 1Hz
                 now = time.time()
