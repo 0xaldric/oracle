@@ -1037,8 +1037,9 @@ class CloudflareBroadcaster:
                     while proc and proc.poll() is None and self._alive:
                         with self._prepared_lock:
                             data = self._prepared[0]
+                            self._prepared[0] = None  # consume — only write each frame once
                         if data is None:
-                            time.sleep(0.01)
+                            time.sleep(0.002)
                             continue
                         try:
                             proc.stdin.write(data)
