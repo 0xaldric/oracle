@@ -274,12 +274,14 @@ class VehicleCounter:
         lx1, ly1 = self.line_start
         lx2, ly2 = self.line_end
 
-        # Detect + track with BoT-SORT on GPU
+        # Detect + track
+        _t_det = time.monotonic()
         results = self.model.track(
             frame, verbose=False, conf=self.confidence,
             classes=VEHICLE_CLASSES, persist=True,
             tracker="bytetrack.yaml", imgsz=640, device=0
         )[0]
+        _t_det_done = time.monotonic()
 
         detections = sv.Detections.from_ultralytics(results)
 
@@ -517,6 +519,12 @@ class VehicleCounter:
                 cv2.line(frame, self.line2_start, self.line2_end, NEON_GREEN, 2)
 
         # HUD removed — frontend handles count/timer display
+
+        # Debug timing (detect vs draw)
+        if self._frame_count % 100 == 0:
+            det_ms = (_t_det_done - _t_det) * 1000
+            draw_ms = (time.monotonic() - _t_det_done) * 1000
+            print(f"[Counter] detect={det_ms:.0f}ms draw={draw_ms:.0f}ms total={det_ms+draw_ms:.0f}ms")
 
         return frame, self.total_count
 
