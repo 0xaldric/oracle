@@ -880,6 +880,9 @@ class CloudflareBroadcaster:
         self._MAX_ERRORS = 5  # restart ffmpeg after this many consecutive errors
         self._write_q = None
         self._writer_thread = None
+        self._raw_q = None  # raw frames from reader for CF writer
+        self._overlay_ref = [None]  # (annotated_frame, mask) set by YOLO worker
+        self._overlay_lock = threading.Lock()
 
         if self.enabled and not self.stream_key:
             print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
@@ -963,26 +966,39 @@ class CloudflareBroadcaster:
             self._error_count = 0
             print(f"[CF] ffmpeg started (pid={self._proc.pid})")
 
-            # Start async writer thread — repeats latest YOLO frame at target fps
-            # YOLO produces ~3fps but we repeat to fill 30fps for smooth playback
-            self._write_q = queue.Queue(maxsize=2)
+            # CF writer thread — reads raw frames from reader, applies YOLO overlay,
+            # writes to ffmpeg at target fps. Fully decoupled from main loop.
+            self._raw_q = queue.Queue(maxsize=2)
+            self._write_q = queue.Queue(maxsize=2)  # kept for backward compat
             def _cf_writer():
                 proc = self._proc
-                wq = self._write_q
-                current_frame = None
+                rq = self._raw_q
+                current_raw = None
                 interval = 1.0 / self.fps
-                while proc and proc.poll() is None and wq is not None:
+                while proc and proc.poll() is None and rq is not None:
                     t0 = time.time()
-                    # Pick up latest YOLO frame if available
+                    # Pick up latest raw frame if available
                     try:
-                        current_frame = wq.get_nowait()
+                        current_raw = rq.get_nowait()
                     except queue.Empty:
                         pass
-                    if current_frame is None:
+                    if current_raw is None:
                         time.sleep(interval)
                         continue
+                    # Apply YOLO overlay onto raw frame
+                    with self._overlay_lock:
+                        ovl = self._overlay_ref[0]
+                    if ovl is not None:
+                        ovl_frame, ovl_mask = ovl
+                        raw_arr = np.frombuffer(current_raw, dtype=np.uint8).reshape(
+                            (self.height, self.width, 3)).copy()
+                        if ovl_frame.shape == raw_arr.shape:
+                            cv2.copyTo(ovl_frame, ovl_mask, raw_arr)
+                        frame_data = raw_arr.tobytes()
+                    else:
+                        frame_data = current_raw
                     try:
-                        proc.stdin.write(current_frame)
+                        proc.stdin.write(frame_data)
                     except (BrokenPipeError, IOError) as e:
                         print(f"[CF Writer] pipe error: {e}")
                         break
@@ -1001,6 +1017,40 @@ class CloudflareBroadcaster:
         except Exception as e:
             print(f"[CF] ERROR starting ffmpeg: {e}")
             self.enabled = False
+
+    def feed_raw(self, frame):
+        """Feed a raw frame directly from reader thread to CF writer.
+
+        The CF writer thread applies YOLO overlay independently.
+        This decouples CF from the main loop for smooth 30fps.
+        """
+        if not self.enabled or self._proc is None:
+            return
+        if self._proc.poll() is not None:
+            print(f"[CF] ffmpeg exited (code={self._proc.returncode}), restarting...")
+            self.start()
+            if not self.enabled or self._proc is None:
+                return
+        if self._raw_q is not None:
+            h, w = frame.shape[:2]
+            if w != self.width or h != self.height:
+                frame = cv2.resize(frame, (self.width, self.height),
+                                   interpolation=cv2.INTER_LINEAR)
+            data = frame.tobytes()
+            while not self._raw_q.empty():
+                try:
+                    self._raw_q.get_nowait()
+                except Exception:
+                    break
+            try:
+                self._raw_q.put_nowait(data)
+            except Exception:
+                pass
+
+    def set_overlay(self, annotated, mask):
+        """Update the YOLO overlay for CF writer to composite onto raw frames."""
+        with self._overlay_lock:
+            self._overlay_ref[0] = (annotated, mask)
 
     def send_frame(self, frame):
         """Send a BGR frame (numpy array) to ffmpeg stdin.
@@ -1054,6 +1104,7 @@ class CloudflareBroadcaster:
 
     def _stop_proc(self):
         self._write_q = None  # signal writer thread to exit
+        self._raw_q = None
         if self._proc is not None:
             try:
                 self._proc.stdin.close()
@@ -1605,6 +1656,9 @@ class StreamServer:
                     f = np.frombuffer(raw, dtype=np.uint8).reshape(
                         (frame_h[0], OUTPUT_WIDTH, 3)).copy()
 
+                    # Feed raw frame to CF writer (30fps, independent of main loop)
+                    self._cf.feed_raw(f)
+
                     # Replace whatever is in the queue with latest frame
                     while not _frame_q.empty():
                         try:
@@ -1646,6 +1700,9 @@ class StreamServer:
                 _, overlay_mask = cv2.threshold(diff_gray, 5, 255, cv2.THRESH_BINARY)
                 # Dilate to cover anti-aliased edges
                 overlay_mask = cv2.dilate(overlay_mask, None, iterations=1)
+
+                # Push overlay to CF broadcaster (CF writer applies it independently)
+                self._cf.set_overlay(annotated, overlay_mask)
 
                 with _yolo_lock:
                     _yolo_result[0] = annotated
@@ -1739,8 +1796,8 @@ class StreamServer:
                 cv2.putText(display, dbg, (w_d - 420, h_d - 8),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 136), 1)
 
-                # Pipe YOLO-annotated frame to Cloudflare Stream
-                self._cf.send_frame(display)
+                # CF is now fed directly from reader thread at 30fps
+                # with YOLO overlay applied by CF writer thread
 
                 # WS: JSON-only state updates at 1Hz
                 now = time.time()
