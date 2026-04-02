@@ -880,9 +880,12 @@ class CloudflareBroadcaster:
         self._MAX_ERRORS = 5  # restart ffmpeg after this many consecutive errors
         self._write_q = None
         self._writer_thread = None
-        self._raw_q = None  # raw frames from reader for CF writer
-        self._overlay_ref = [None]  # (annotated_frame, mask) set by YOLO worker
+        # Shared state for smooth CF pipeline (no queues, no serialize/deserialize)
+        self._latest_frame = None       # numpy array from reader (set by feed_raw)
+        self._frame_lock = threading.Lock()
+        self._overlay_ref = [None]      # (annotated_frame, mask) from YOLO worker
         self._overlay_lock = threading.Lock()
+        self._buf = None                # pre-allocated write buffer
 
         if self.enabled and not self.stream_key:
             print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
@@ -966,43 +969,50 @@ class CloudflareBroadcaster:
             self._error_count = 0
             print(f"[CF] ffmpeg started (pid={self._proc.pid})")
 
-            # CF writer thread — reads raw frames from reader, applies YOLO overlay,
-            # writes to ffmpeg at target fps. Fully decoupled from main loop.
-            self._raw_q = queue.Queue(maxsize=2)
-            self._write_q = queue.Queue(maxsize=2)  # kept for backward compat
+            # CF writer thread — reads latest raw frame (shared ref, no queue),
+            # applies YOLO overlay using pre-allocated buffer, writes at exact 30fps.
+            # Zero unnecessary memory allocation = smooth streaming.
+            self._buf = np.empty((self.height, self.width, 3), dtype=np.uint8)
+            self._alive = True
             def _cf_writer():
                 proc = self._proc
-                rq = self._raw_q
-                current_raw = None
+                buf = self._buf
                 interval = 1.0 / self.fps
+                has_frame = False
                 try:
-                    while proc and proc.poll() is None and rq is not None:
+                    while proc and proc.poll() is None and self._alive:
                         t0 = time.time()
-                        # Pick up latest raw frame if available
-                        try:
-                            current_raw = rq.get_nowait()
-                        except queue.Empty:
-                            pass
-                        if current_raw is None:
+                        # Grab latest raw frame (lock-free read of reference)
+                        with self._frame_lock:
+                            raw = self._latest_frame
+                        if raw is None:
                             time.sleep(interval)
                             continue
-                        # Apply YOLO overlay onto raw frame
-                        frame_data = current_raw
+                        # Copy raw frame into pre-allocated buffer
+                        try:
+                            if raw.shape == buf.shape:
+                                np.copyto(buf, raw)
+                                has_frame = True
+                            elif not has_frame:
+                                time.sleep(interval)
+                                continue
+                        except Exception:
+                            if not has_frame:
+                                time.sleep(interval)
+                                continue
+                        # Apply YOLO overlay in-place on buffer
                         try:
                             with self._overlay_lock:
                                 ovl = self._overlay_ref[0]
                             if ovl is not None:
                                 ovl_frame, ovl_mask = ovl
-                                raw_arr = np.frombuffer(current_raw, dtype=np.uint8).reshape(
-                                    (self.height, self.width, 3)).copy()
-                                if ovl_frame.shape == raw_arr.shape:
-                                    cv2.copyTo(ovl_frame, ovl_mask, raw_arr)
-                                frame_data = raw_arr.tobytes()
+                                if ovl_frame.shape == buf.shape:
+                                    cv2.copyTo(ovl_frame, ovl_mask, buf)
                         except Exception as e:
                             print(f"[CF Writer] overlay error (skipped): {e}")
-                            frame_data = current_raw  # fallback to raw
+                        # Write to ffmpeg — single tobytes(), no extra copies
                         try:
-                            proc.stdin.write(frame_data)
+                            proc.stdin.write(buf.tobytes())
                         except (BrokenPipeError, IOError) as e:
                             print(f"[CF Writer] pipe error: {e}")
                             break
@@ -1022,10 +1032,9 @@ class CloudflareBroadcaster:
             self.enabled = False
 
     def feed_raw(self, frame):
-        """Feed a raw frame directly from reader thread to CF writer.
+        """Feed a raw frame from reader thread. Just sets a shared reference.
 
-        The CF writer thread applies YOLO overlay independently.
-        This decouples CF from the main loop for smooth 30fps.
+        No queue, no serialization — writer thread reads this directly.
         """
         if not self.enabled or self._proc is None:
             return
@@ -1041,21 +1050,12 @@ class CloudflareBroadcaster:
             self.start()
             if not self.enabled or self._proc is None:
                 return
-        if self._raw_q is not None:
-            h, w = frame.shape[:2]
-            if w != self.width or h != self.height:
-                frame = cv2.resize(frame, (self.width, self.height),
-                                   interpolation=cv2.INTER_LINEAR)
-            data = frame.tobytes()
-            while not self._raw_q.empty():
-                try:
-                    self._raw_q.get_nowait()
-                except Exception:
-                    break
-            try:
-                self._raw_q.put_nowait(data)
-            except Exception:
-                pass
+        h, w = frame.shape[:2]
+        if w != self.width or h != self.height:
+            frame = cv2.resize(frame, (self.width, self.height),
+                               interpolation=cv2.INTER_LINEAR)
+        with self._frame_lock:
+            self._latest_frame = frame
 
     def set_overlay(self, annotated, mask):
         """Update the YOLO overlay for CF writer to composite onto raw frames."""
@@ -1113,8 +1113,9 @@ class CloudflareBroadcaster:
             print(f"[CF] Stopped after {self._frame_count} frames")
 
     def _stop_proc(self):
-        self._write_q = None  # signal writer thread to exit
-        self._raw_q = None
+        self._alive = False   # signal writer thread to exit
+        self._write_q = None
+        self._latest_frame = None
         if self._proc is not None:
             try:
                 self._proc.stdin.close()
