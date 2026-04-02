@@ -278,7 +278,7 @@ class VehicleCounter:
         results = self.model.track(
             frame, verbose=False, conf=self.confidence,
             classes=VEHICLE_CLASSES, persist=True,
-            tracker="botsort_custom.yaml", imgsz=1280, device=0
+            tracker="botsort_custom.yaml", imgsz=640, device=0
         )[0]
 
         detections = sv.Detections.from_ultralytics(results)
