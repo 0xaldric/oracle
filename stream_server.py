@@ -882,8 +882,9 @@ class CloudflareBroadcaster:
         self._frame_count = 0
         self._writer_thread = None
         self._alive = False
-        self._latest_frame = None
-        self._latest_lock = threading.Lock()
+        # Large queue: main loop pushes ~12fps, CF writer reads smoothly.
+        # CF can be up to 2 min behind real-time but always smooth.
+        self._frame_q = queue.Queue(maxsize=1500)  # ~2 min at 12fps input
 
         if self.enabled and not self.stream_key:
             print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
@@ -981,61 +982,75 @@ class CloudflareBroadcaster:
             # Uses monotonic clock to maintain exact 30fps pace.
             # write() may block (pipe full) — that's fine, clock catches up after.
             # Queue buffers ~30s of YOLO frames for resilience.
-            # Single-slot latest frame — writer always shows the NEWEST frame.
-            # No queue lag, no buildup. If write blocks, we skip to current on unblock.
+            # Queue-based writer with adaptive repeat.
+            # Main loop pushes ~12fps. Writer outputs 45fps.
+            # Each popped frame is repeated `rpt` times to match rates.
+            # Adaptive: if queue grows too large, reduce repeats (play faster).
+            # If queue gets small, increase repeats (play slower).
+            # Result: CF stream is always smooth 45fps, just delayed.
             self._alive = True
-            self._latest_frame = None
-            self._latest_lock = threading.Lock()
+            TARGET_Q = 360       # target queue depth (~30s at 12fps)
+            MIN_RPT = 2          # min repeats (= max play speed)
+            MAX_RPT = 6          # max repeats (= min play speed)
+            INIT_RPT = 4         # initial: 45fps / 12fps ≈ 4
             def _cf_writer():
                 proc = self._proc
+                fq = self._frame_q
                 interval = 1.0 / cfps
                 current = None
+                repeats_left = 0
+                rpt = INIT_RPT
                 frame_n = 0
                 new_count = 0
-                repeat_count = 0
+                rpt_count = 0
                 next_time = time.monotonic()
                 last_log = time.monotonic()
                 try:
                     while proc and proc.poll() is None and self._alive:
-                        # Always grab latest frame (non-blocking)
-                        with self._latest_lock:
-                            latest = self._latest_frame
-                        if latest is not None:
-                            if latest is not current:
-                                current = latest
+                        # Pop new frame when current exhausted
+                        if repeats_left <= 0:
+                            try:
+                                current = fq.get_nowait()
                                 new_count += 1
-                            else:
-                                repeat_count += 1
-                        elif current is None:
-                            time.sleep(0.01)
-                            next_time = time.monotonic()
-                            continue
+                                # Adapt repeat count based on queue depth
+                                qs = fq.qsize()
+                                if qs > TARGET_Q + 100:
+                                    rpt = max(MIN_RPT, rpt - 1)
+                                elif qs < TARGET_Q - 100:
+                                    rpt = min(MAX_RPT, rpt + 1)
+                                repeats_left = rpt
+                            except queue.Empty:
+                                if current is None:
+                                    time.sleep(0.03)
+                                    next_time = time.monotonic()
+                                    continue
+                                repeats_left = 1  # hold last frame
+                                rpt_count += 1
                         # Wait until next frame time
                         now = time.monotonic()
                         wait = next_time - now
                         if wait > 0:
                             time.sleep(wait)
                         next_time += interval
-                        # Prevent drift: if we fell behind, reset clock
                         if time.monotonic() - next_time > 1.0:
                             next_time = time.monotonic()
-                        t0 = time.monotonic()
                         try:
                             proc.stdin.write(current)
                             frame_n += 1
+                            repeats_left -= 1
                         except (BrokenPipeError, IOError) as e:
                             print(f"[CF Writer] pipe error: {e}")
                             break
-                        wd = time.monotonic() - t0
-                        # Debug log every 5 seconds
+                        # Debug every 5s
                         if time.monotonic() - last_log >= 5.0:
                             last_log = time.monotonic()
-                            print(f"[CF Writer] frames={frame_n} new={new_count} repeat={repeat_count} write={wd*1000:.1f}ms")
+                            qs = fq.qsize()
+                            print(f"[CF Writer] frames={frame_n} new={new_count} hold={rpt_count} q={qs} rpt={rpt}")
                             new_count = 0
-                            repeat_count = 0
+                            rpt_count = 0
                 except Exception as e:
                     print(f"[CF Writer] FATAL: {e}")
-                print(f"[CF Writer] exiting (wrote {frame_n} frames)")
+                print(f"[CF Writer] exiting (wrote {frame_n} frames, q={fq.qsize()})")
             self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
             self._writer_thread.start()
         except FileNotFoundError:
@@ -1070,8 +1085,10 @@ class CloudflareBroadcaster:
             frame = cv2.resize(frame, (self._cf_w, self._cf_h),
                                interpolation=cv2.INTER_LINEAR)
         data = frame.tobytes()
-        with self._latest_lock:
-            self._latest_frame = data
+        try:
+            self._frame_q.put_nowait(data)
+        except queue.Full:
+            pass  # queue full — oldest frames stay, newest dropped
         self._frame_count += 1
 
     def stop(self):
@@ -1082,8 +1099,11 @@ class CloudflareBroadcaster:
 
     def _stop_proc(self):
         self._alive = False
-        with self._latest_lock:
-            self._latest_frame = None
+        while not self._frame_q.empty():
+            try:
+                self._frame_q.get_nowait()
+            except queue.Empty:
+                break
         if self._proc is not None:
             try:
                 self._proc.stdin.close()
