@@ -1011,35 +1011,15 @@ class StreamServer:
         self.clients.discard(ws)
         print(f"[WS] Client disconnected ({len(self.clients)} total)")
 
-    async def _broadcast(self, json_msg, jpeg_bytes):
-        """Send JSON + binary frame to all connected clients. Timeout per client."""
-        if not self.clients:
-            return
-        dead = set()
-        async def send_to(ws):
-            try:
-                await asyncio.wait_for(ws.send(json_msg), timeout=1)
-                await asyncio.wait_for(ws.send(jpeg_bytes), timeout=1)
-            except Exception:
-                dead.add(ws)
-        await asyncio.gather(*(send_to(ws) for ws in list(self.clients)))
-        if dead:
-            self.clients -= dead
-            for ws in dead:
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
-
     async def _broadcast_json(self, msg):
-        """Send JSON-only message to all clients."""
+        """Send JSON-only message to all clients. Cleans up dead connections."""
         if not self.clients:
             return
-        raw = json.dumps(msg)
+        raw = json.dumps(msg) if isinstance(msg, dict) else msg
         dead = set()
         async def send_to(ws):
             try:
-                await asyncio.wait_for(ws.send(raw), timeout=1)
+                await asyncio.wait_for(ws.send(raw), timeout=2)
             except Exception:
                 dead.add(ws)
         await asyncio.gather(*(send_to(ws) for ws in list(self.clients)))
@@ -1331,40 +1311,41 @@ class StreamServer:
                 cv2.putText(display, dbg, (w_d - 420, h_d - 8),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 136), 1)
 
-                # Encode JPEG
-                _, jpeg = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 65])
-                jpeg_bytes = jpeg.tobytes()
-
                 # ── Pipe frame to Cloudflare Stream at FULL FPS ────────
                 self._cf.send_frame(display)
 
-                # ── Broadcast based on state ─────────────────────────
-                _video_uid_field = {"videoUid": self._cf.video_uid} if self._cf.video_uid else {}
-                if self._round_active:
-                    round_elapsed = time.time() - self._round_start_time
-                    msg = json.dumps({
-                        "type": "count",
-                        "state": "counting",
-                        "count": count,
-                        "count_in": self.counter.count_in,
-                        "count_out": self.counter.count_out,
-                        "elapsed": round(round_elapsed, 1),
-                        "remaining": max(0, round(self._round_duration - round_elapsed, 1)),
-                        "marketAddress": self._round_market,
-                        "cameraId": self.camera_id,
-                        "roundId": self._round_id,
-                        "seq": frame_idx,
-                        **_video_uid_field,
-                    })
-                else:
-                    msg = json.dumps({
-                        "type": "idle",
-                        "state": "waiting",
-                        "cameraId": self.camera_id,
-                        **_video_uid_field,
-                    })
-
-                await self._broadcast(msg, jpeg_bytes)
+                # ── WS: JSON-only state updates at 1Hz (no binary frames) ──
+                # Video goes through Cloudflare Stream; WS is for lightweight control only
+                _ws_now = time.time()
+                if not hasattr(self, '_last_ws_broadcast'):
+                    self._last_ws_broadcast = 0
+                if _ws_now - self._last_ws_broadcast >= 1.0:
+                    self._last_ws_broadcast = _ws_now
+                    _video_uid_field = {"videoUid": self._cf.video_uid} if self._cf.video_uid else {}
+                    if self._round_active:
+                        round_elapsed = _ws_now - self._round_start_time
+                        msg = {
+                            "type": "count",
+                            "state": "counting",
+                            "count": count,
+                            "count_in": self.counter.count_in,
+                            "count_out": self.counter.count_out,
+                            "elapsed": round(round_elapsed, 1),
+                            "remaining": max(0, round(self._round_duration - round_elapsed, 1)),
+                            "marketAddress": self._round_market,
+                            "cameraId": self.camera_id,
+                            "roundId": self._round_id,
+                            "seq": frame_idx,
+                            **_video_uid_field,
+                        }
+                    else:
+                        msg = {
+                            "type": "idle",
+                            "state": "waiting",
+                            "cameraId": self.camera_id,
+                            **_video_uid_field,
+                        }
+                    await self._broadcast_json(msg)
 
                 # ── Evidence capture (only during round) ─────────────
                 if self._round_active:
