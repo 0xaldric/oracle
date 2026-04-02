@@ -1674,7 +1674,7 @@ class StreamServer:
         threading.Thread(target=_reader, daemon=True).start()
 
         # YOLO inference thread
-        _yolo_q = _queue.Queue(maxsize=1)
+        _yolo_q = _queue.Queue(maxsize=5)
         _yolo_result = [None, 0]
         _yolo_lock = threading.Lock()
 
