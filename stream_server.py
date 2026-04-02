@@ -874,14 +874,18 @@ class CloudflareBroadcaster:
         self.width = width
         self.height = height
         self.fps = fps
+        # CF pipe uses smaller resolution for faster writes (1.55MB vs 2.7MB per frame)
+        self._cf_w = 960
+        self._cf_h = 540
+        self._cf_fps = 45
         self._proc = None
         self._frame_count = 0
         self._writer_thread = None
         self._alive = False
         # Queue of YOLO-annotated frames (bytes). YOLO pushes ~3fps,
-        # writer pops and repeats each frame to fill 30fps.
+        # writer pops and repeats each frame to fill 45fps.
         # Large queue = buffer against stdin.write blocking.
-        self._frame_q = queue.Queue(maxsize=90)  # ~30s buffer at 3fps
+        self._frame_q = queue.Queue(maxsize=135)  # ~45s buffer at 3fps
 
         if self.enabled and not self.stream_key:
             print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
@@ -906,6 +910,7 @@ class CloudflareBroadcaster:
             return
         self._stop_proc()
 
+        cw, ch, cfps = self._cf_w, self._cf_h, self._cf_fps
         rtmps_dest = f"{self.rtmps_url}{self.stream_key}"
         # Try NVENC (GPU encoding) first, fall back to libx264
         use_nvenc = self._check_nvenc()
@@ -916,22 +921,22 @@ class CloudflareBroadcaster:
                 '-f', 'rawvideo',
                 '-vcodec', 'rawvideo',
                 '-pix_fmt', 'bgr24',
-                '-s', f'{self.width}x{self.height}',
-                '-r', str(self.fps),
+                '-s', f'{cw}x{ch}',
+                '-r', str(cfps),
                 '-i', '-',
                 '-c:v', 'h264_nvenc',       # GPU encoding
                 '-preset', 'p1',            # fastest NVENC preset
                 '-tune', 'll',              # low latency
                 '-rc', 'cbr',               # constant bitrate
                 '-pix_fmt', 'yuv420p',
-                '-g', str(self.fps * 2),
+                '-g', str(cfps * 2),
                 '-b:v', '500k',
                 '-maxrate', '600k',
                 '-bufsize', '300k',         # smaller buffer = lower latency
                 '-f', 'flv',
                 rtmps_dest,
             ]
-            print("[CF] Using NVENC (GPU) encoding")
+            print(f"[CF] Using NVENC (GPU) encoding @ {cw}x{ch} {cfps}fps")
         else:
             cmd = [
                 'ffmpeg',
@@ -939,21 +944,21 @@ class CloudflareBroadcaster:
                 '-f', 'rawvideo',
                 '-vcodec', 'rawvideo',
                 '-pix_fmt', 'bgr24',
-                '-s', f'{self.width}x{self.height}',
-                '-r', str(self.fps),
+                '-s', f'{cw}x{ch}',
+                '-r', str(cfps),
                 '-i', '-',
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
-                '-g', str(self.fps * 2),
+                '-g', str(cfps * 2),
                 '-b:v', '500k',
                 '-maxrate', '600k',
                 '-bufsize', '300k',
                 '-f', 'flv',
                 rtmps_dest,
             ]
-            print("[CF] Using libx264 (CPU) encoding")
+            print(f"[CF] Using libx264 (CPU) encoding @ {cw}x{ch} {cfps}fps")
 
         try:
             self._proc = subprocess.Popen(
@@ -979,11 +984,11 @@ class CloudflareBroadcaster:
             # write() may block (pipe full) — that's fine, clock catches up after.
             # Queue buffers ~30s of YOLO frames for resilience.
             self._alive = True
-            repeat_count = max(1, self.fps // 3)  # ~10 repeats per YOLO frame
+            repeat_count = max(1, cfps // 3)  # ~15 repeats per YOLO frame @ 45fps
             def _cf_writer():
                 proc = self._proc
                 fq = self._frame_q
-                interval = 1.0 / self.fps
+                interval = 1.0 / cfps
                 current = None
                 repeats_left = 0
                 frame_n = 0
@@ -1050,8 +1055,8 @@ class CloudflareBroadcaster:
                 return
 
         h, w = frame.shape[:2]
-        if w != self.width or h != self.height:
-            frame = cv2.resize(frame, (self.width, self.height),
+        if w != self._cf_w or h != self._cf_h:
+            frame = cv2.resize(frame, (self._cf_w, self._cf_h),
                                interpolation=cv2.INTER_LINEAR)
         data = frame.tobytes()
         try:
