@@ -536,21 +536,24 @@ def _save_url_cache(cache):
     except Exception:
         pass
 
-def get_stream_url(youtube_url):
+def get_stream_url(youtube_url, force_refresh=False):
     """Extract direct stream URL using yt-dlp. Cached on disk to avoid rate limits."""
     import os
 
     if 'youtube.com' not in youtube_url and 'youtu.be' not in youtube_url:
         return youtube_url
 
-    # Return cached URL if fresh
+    # Return cached URL if fresh (unless force refresh)
     cache = _load_url_cache()
-    if youtube_url in cache:
+    if not force_refresh and youtube_url in cache:
         cached_url, cached_ts = cache[youtube_url]
         age = time.time() - cached_ts
         if age < _URL_CACHE_TTL:
             print(f"[yt-dlp] Using cached URL (age {int(age)}s)")
             return cached_url
+
+    if force_refresh:
+        print(f"[yt-dlp] Force refresh for camera switch")
 
     deno_path = os.path.expanduser("~/.deno/bin")
     env = os.environ.copy()
@@ -1159,10 +1162,13 @@ class StreamServer:
         _last_frame_time = [time.time()]
         self._switch_event = threading.Event()
 
+        _force_refresh = [False]  # Force yt-dlp refresh after camera switch
+
         def _reader():
             while _reader_alive[0]:
                 if self._switch_event.is_set():
                     self._switch_event.clear()
+                    _force_refresh[0] = True
                     print("[Reader] Camera switch — reconnecting to new stream...")
                     try:
                         c = _cap_holder[0]
@@ -1183,7 +1189,8 @@ class StreamServer:
                     try:
                         if c is not None:
                             c.release()
-                        new_url = get_stream_url(self.stream_url)
+                        new_url = get_stream_url(self.stream_url, force_refresh=_force_refresh[0])
+                        _force_refresh[0] = False
                         _cap_holder[0] = cv2.VideoCapture(new_url)
                         _last_frame_time[0] = time.time()
                         print("[Reader] Reconnected")
