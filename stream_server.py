@@ -1373,7 +1373,7 @@ class StreamServer:
                     await asyncio.sleep(0)
 
         except Exception as e:
-            print(f"\n[ERROR] {e}")
+            print(f"\n[ERROR] process_video: {e}")
             import traceback
             traceback.print_exc()
         finally:
@@ -1381,7 +1381,7 @@ class StreamServer:
             if _cap_holder[0] is not None:
                 _cap_holder[0].release()
             self._cf.stop()
-            self.running = False
+            # Don't set self.running = False — let outer loop restart us
 
     async def handler(self, ws):
         accepted = await self.register(ws)
@@ -1403,6 +1403,7 @@ class StreamServer:
                             "roundId": self._round_id,
                             "cameraId": self.camera_id,
                         }))
+
 
                     elif msg_type == "stop_round":
                         result = self._stop_round()
@@ -1431,6 +1432,8 @@ class StreamServer:
 
                 except Exception:
                     pass
+        except websockets.exceptions.ConnectionClosedError:
+            pass  # normal disconnect — no traceback needed
         finally:
             await self.unregister(ws)
 
@@ -1449,8 +1452,21 @@ class StreamServer:
             print(f"  CF Broadcast: OFF")
         print(f"{'='*55}\n")
 
-        async with websockets.serve(self.handler, self.host, self.port):
-            await self.process_video()
+        async with websockets.serve(
+            self.handler, self.host, self.port,
+            ping_interval=30,
+            ping_timeout=60,
+        ):
+            # Keep WS server alive forever — restart process_video on crash
+            while True:
+                try:
+                    await self.process_video()
+                except Exception as e:
+                    print(f"\n[RESTART] process_video crashed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("[RESTART] Restarting in 5s...")
+                    await asyncio.sleep(5)
 
 
 def load_camera(camera_id):
