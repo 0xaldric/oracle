@@ -2,7 +2,7 @@
 SinalBet Oracle — Live YOLO Streaming Server (v3 — Supervision SOTA)
 
 State-of-the-art vehicle counting using:
-  - YOLOv8x/YOLO11x for detection
+  - YOLO12x for detection (attention-centric architecture)
   - BoT-SORT for multi-object tracking (persistent IDs)
   - Supervision LineZone with minimum_crossing_threshold (no jitter double-counts)
   - DetectionsSmoother for temporal stability
@@ -61,7 +61,7 @@ class VehicleCounter:
     - Never recounts same ID
     """
 
-    def __init__(self, model_name='yolov8x.pt', confidence=0.20,
+    def __init__(self, model_name='yolo12x.pt', confidence=0.20,
                  line_position=0.45, line_angle=10, line_points=None,
                  count_mode='line', min_frames=5, lanes=None, **_kwargs):
         self.count_mode = count_mode
@@ -742,7 +742,7 @@ class StreamServer:
     STATE_COUNTING = "counting"
 
     def __init__(self, stream_url, host='0.0.0.0', port=8765,
-                 model='yolov8x.pt', confidence=0.10, line_pos=0.5,
+                 model='yolo12x.pt', confidence=0.10, line_pos=0.5,
                  line_angle=10, line_points=None, line_points2=None,
                  count_mode='uid', lanes=None, target_fps=8, camera_id='',
                  roi=None, **kwargs):
@@ -1340,8 +1340,8 @@ def main():
     group.add_argument('--stream', '-s', help='Direct stream URL (HLS, RTSP, YouTube)')
     group.add_argument('--camera', help='Camera ID from cameras.json')
     parser.add_argument('--port', '-p', type=int, default=8765, help='WebSocket port')
-    parser.add_argument('--model', '-m', default='yolov8x.pt',
-                       help='YOLO model (yolov8n=fast, yolov8s=balanced, yolov8x=best)')
+    parser.add_argument('--model', '-m', default='yolo12x.pt',
+                       help='YOLO model (yolo12n=fast, yolo12s=balanced, yolo12x=best)')
     parser.add_argument('--confidence', '-c', type=float, default=0.15, help='Detection confidence')
     parser.add_argument('--line', '-l', type=float, default=0.5, help='Counting line position (0-1)')
     parser.add_argument('--angle', '-a', type=float, default=10, help='Line tilt in degrees')

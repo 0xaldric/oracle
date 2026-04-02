@@ -200,22 +200,22 @@
       "resolution": "1280x720"
     },
     {
-      "id": "der-sp008-km095",
-      "name": "SP-008 km095 Braganca Paulista",
-      "region": "Sao Paulo, BR",
-      "source": "DER-SP",
-      "imageUrl": "https://www.der.sp.gov.br/Upload/Cameras/CamSP008km095S1.jpg",
-      "type": "jpeg",
-      "refreshInterval": 20
+      "id": "gramado-centre",
+      "name": "Gramado Centre — Live Street",
+      "region": "Gramado, RS, Brazil",
+      "source": "GramadoTV",
+      "streamUrl": "https://www.youtube.com/watch?v=_qpQWf-NpZk",
+      "type": "youtube",
+      "resolution": "1280x720"
     },
     {
-      "id": "der-sp055-km093",
-      "name": "SP-055 km093 Caraguatatuba",
-      "region": "Sao Paulo, BR",
-      "source": "DER-SP",
-      "imageUrl": "https://www.der.sp.gov.br/Upload/Cameras/CamSP055km093S1.jpg",
-      "type": "jpeg",
-      "refreshInterval": 20
+      "id": "peace-bridge-trucks",
+      "name": "Peace Bridge — Canada Bound Truck Inspection",
+      "region": "Buffalo, NY / Fort Erie, ON",
+      "source": "Peace Bridge Authority",
+      "streamUrl": "https://www.youtube.com/watch?v=g9hNGJxw6Yw",
+      "type": "youtube",
+      "resolution": "1280x720"
     },
     {
       "id": "der-sp324-km081",
