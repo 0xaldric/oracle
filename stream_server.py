@@ -882,10 +882,8 @@ class CloudflareBroadcaster:
         self._frame_count = 0
         self._writer_thread = None
         self._alive = False
-        # Queue of YOLO-annotated frames (bytes). YOLO pushes ~3fps,
-        # writer pops and repeats each frame to fill 45fps.
-        # Large queue = buffer against stdin.write blocking.
-        self._frame_q = queue.Queue(maxsize=135)  # ~45s buffer at 3fps
+        self._latest_frame = None
+        self._latest_lock = threading.Lock()
 
         if self.enabled and not self.stream_key:
             print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
@@ -983,29 +981,35 @@ class CloudflareBroadcaster:
             # Uses monotonic clock to maintain exact 30fps pace.
             # write() may block (pipe full) — that's fine, clock catches up after.
             # Queue buffers ~30s of YOLO frames for resilience.
+            # Single-slot latest frame — writer always shows the NEWEST frame.
+            # No queue lag, no buildup. If write blocks, we skip to current on unblock.
             self._alive = True
-            repeat_count = max(1, cfps // 3)  # ~15 repeats per YOLO frame @ 45fps
+            self._latest_frame = None
+            self._latest_lock = threading.Lock()
             def _cf_writer():
                 proc = self._proc
-                fq = self._frame_q
                 interval = 1.0 / cfps
                 current = None
-                repeats_left = 0
                 frame_n = 0
+                new_count = 0
+                repeat_count = 0
                 next_time = time.monotonic()
+                last_log = time.monotonic()
                 try:
                     while proc and proc.poll() is None and self._alive:
-                        # Get next YOLO frame when current exhausted
-                        if repeats_left <= 0:
-                            try:
-                                current = fq.get_nowait()
-                                repeats_left = repeat_count
-                            except queue.Empty:
-                                if current is None:
-                                    time.sleep(0.03)
-                                    next_time = time.monotonic()
-                                    continue
-                                repeats_left = 1
+                        # Always grab latest frame (non-blocking)
+                        with self._latest_lock:
+                            latest = self._latest_frame
+                        if latest is not None:
+                            if latest is not current:
+                                current = latest
+                                new_count += 1
+                            else:
+                                repeat_count += 1
+                        elif current is None:
+                            time.sleep(0.01)
+                            next_time = time.monotonic()
+                            continue
                         # Wait until next frame time
                         now = time.monotonic()
                         wait = next_time - now
@@ -1015,16 +1019,23 @@ class CloudflareBroadcaster:
                         # Prevent drift: if we fell behind, reset clock
                         if time.monotonic() - next_time > 1.0:
                             next_time = time.monotonic()
+                        t0 = time.monotonic()
                         try:
                             proc.stdin.write(current)
                             frame_n += 1
-                            repeats_left -= 1
                         except (BrokenPipeError, IOError) as e:
                             print(f"[CF Writer] pipe error: {e}")
                             break
+                        wd = time.monotonic() - t0
+                        # Debug log every 5 seconds
+                        if time.monotonic() - last_log >= 5.0:
+                            last_log = time.monotonic()
+                            print(f"[CF Writer] frames={frame_n} new={new_count} repeat={repeat_count} write={wd*1000:.1f}ms")
+                            new_count = 0
+                            repeat_count = 0
                 except Exception as e:
                     print(f"[CF Writer] FATAL: {e}")
-                print(f"[CF Writer] exiting (wrote {frame_n} frames, q={fq.qsize()})")
+                print(f"[CF Writer] exiting (wrote {frame_n} frames)")
             self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
             self._writer_thread.start()
         except FileNotFoundError:
@@ -1059,10 +1070,8 @@ class CloudflareBroadcaster:
             frame = cv2.resize(frame, (self._cf_w, self._cf_h),
                                interpolation=cv2.INTER_LINEAR)
         data = frame.tobytes()
-        try:
-            self._frame_q.put_nowait(data)
-        except queue.Full:
-            pass  # queue full — writer will catch up
+        with self._latest_lock:
+            self._latest_frame = data
         self._frame_count += 1
 
     def stop(self):
@@ -1653,17 +1662,26 @@ class StreamServer:
         _yolo_result = [None, 0]
         _yolo_lock = threading.Lock()
 
+        _yolo_frame_id = [0]
+        _yolo_last_log = [time.monotonic()]
         def _yolo_worker():
             while _reader_alive[0]:
                 try:
                     yf = _yolo_q.get(timeout=1)
                 except _queue.Empty:
                     continue
+                t0 = time.monotonic()
                 yolo_input = self.apply_roi(yf)
                 annotated, cnt = self.counter.process_frame(yolo_input)
+                yolo_ms = (time.monotonic() - t0) * 1000
                 with _yolo_lock:
                     _yolo_result[0] = annotated
                     _yolo_result[1] = cnt
+                _yolo_frame_id[0] += 1
+                now = time.monotonic()
+                if now - _yolo_last_log[0] >= 5.0:
+                    _yolo_last_log[0] = now
+                    print(f"[YOLO] frame={_yolo_frame_id[0]} infer={yolo_ms:.0f}ms count={cnt}")
 
         threading.Thread(target=_yolo_worker, daemon=True).start()
 
