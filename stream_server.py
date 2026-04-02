@@ -982,50 +982,51 @@ class CloudflareBroadcaster:
             # Uses monotonic clock to maintain exact 30fps pace.
             # write() may block (pipe full) — that's fine, clock catches up after.
             # Queue buffers ~30s of YOLO frames for resilience.
-            # Queue-based writer with adaptive repeat.
+            # Queue-based writer with fractional rate matching.
             # Main loop pushes ~12fps. Writer outputs 45fps.
-            # Each popped frame is repeated `rpt` times to match rates.
-            # Adaptive: if queue grows too large, reduce repeats (play faster).
-            # If queue gets small, increase repeats (play slower).
-            # Result: CF stream is always smooth 45fps, just delayed.
+            # Uses a float accumulator to pop frames at exact input rate.
+            # pop_rate adapts to keep queue at TARGET_Q depth.
+            # Result: perfectly smooth 45fps, content updates ~12fps evenly.
             self._alive = True
             TARGET_Q = 360       # target queue depth (~30s at 12fps)
-            MIN_RPT = 2          # min repeats (= max play speed)
-            MAX_RPT = 6          # max repeats (= min play speed)
-            INIT_RPT = 4         # initial: 45fps / 12fps ≈ 4
             def _cf_writer():
                 proc = self._proc
                 fq = self._frame_q
                 interval = 1.0 / cfps
                 current = None
-                repeats_left = 0
-                rpt = INIT_RPT
                 frame_n = 0
                 new_count = 0
-                rpt_count = 0
+                hold_count = 0
+                # pop_rate: fraction of frames popped per write.
+                # 12fps input / 45fps output = 0.267 (pop 1 every ~3.75 writes)
+                pop_rate = 12.0 / cfps
+                pop_accum = 0.0
                 next_time = time.monotonic()
                 last_log = time.monotonic()
+                last_adjust = time.monotonic()
                 try:
                     while proc and proc.poll() is None and self._alive:
-                        # Pop new frame when current exhausted
-                        if repeats_left <= 0:
+                        # Fractional pop: accumulate and pop when >= 1.0
+                        pop_accum += pop_rate
+                        if pop_accum >= 1.0:
+                            pop_accum -= 1.0
                             try:
                                 current = fq.get_nowait()
                                 new_count += 1
-                                # Adapt repeat count based on queue depth
-                                qs = fq.qsize()
-                                if qs > TARGET_Q + 100:
-                                    rpt = max(MIN_RPT, rpt - 1)
-                                elif qs < TARGET_Q - 100:
-                                    rpt = min(MAX_RPT, rpt + 1)
-                                repeats_left = rpt
                             except queue.Empty:
+                                pop_accum = 0.0
+                                hold_count += 1
                                 if current is None:
                                     time.sleep(0.03)
                                     next_time = time.monotonic()
                                     continue
-                                repeats_left = 1  # hold last frame
-                                rpt_count += 1
+                        elif current is None:
+                            # No frame yet at all — wait for first frame
+                            try:
+                                current = fq.get(timeout=0.1)
+                                new_count += 1
+                            except queue.Empty:
+                                continue
                         # Wait until next frame time
                         now = time.monotonic()
                         wait = next_time - now
@@ -1037,17 +1038,26 @@ class CloudflareBroadcaster:
                         try:
                             proc.stdin.write(current)
                             frame_n += 1
-                            repeats_left -= 1
                         except (BrokenPipeError, IOError) as e:
                             print(f"[CF Writer] pipe error: {e}")
                             break
-                        # Debug every 5s
-                        if time.monotonic() - last_log >= 5.0:
-                            last_log = time.monotonic()
+                        # Adapt pop_rate every 2s based on queue depth
+                        now_m = time.monotonic()
+                        if now_m - last_adjust >= 2.0:
+                            last_adjust = now_m
                             qs = fq.qsize()
-                            print(f"[CF Writer] frames={frame_n} new={new_count} hold={rpt_count} q={qs} rpt={rpt}")
+                            if qs > TARGET_Q + 30:
+                                pop_rate = min(0.5, pop_rate + 0.01)   # consume faster
+                            elif qs < TARGET_Q - 30:
+                                pop_rate = max(0.1, pop_rate - 0.01)   # consume slower
+                        # Debug every 5s
+                        if now_m - last_log >= 5.0:
+                            last_log = now_m
+                            qs = fq.qsize()
+                            ufps = new_count / 5.0
+                            print(f"[CF Writer] frames={frame_n} new={new_count}({ufps:.1f}fps) hold={hold_count} q={qs} rate={pop_rate:.3f}")
                             new_count = 0
-                            rpt_count = 0
+                            hold_count = 0
                 except Exception as e:
                     print(f"[CF Writer] FATAL: {e}")
                 print(f"[CF Writer] exiting (wrote {frame_n} frames, q={fq.qsize()})")
