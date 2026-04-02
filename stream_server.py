@@ -279,7 +279,7 @@ class VehicleCounter:
         results = self.model.track(
             frame, verbose=False, conf=self.confidence,
             classes=VEHICLE_CLASSES, persist=True,
-            tracker="bytetrack.yaml", imgsz=640, device=0
+            tracker="botsort_custom.yaml", imgsz=960, device=0
         )[0]
         _t_det_done = time.monotonic()
 
@@ -1007,8 +1007,8 @@ class CloudflareBroadcaster:
                 new_count = 0
                 hold_count = 0
                 # pop_rate: fraction of frames popped per write.
-                # ~15fps YOLO input / 45fps output = 0.333 (pop 1 every ~3 writes)
-                pop_rate = 15.0 / cfps
+                # ~10fps YOLO input / 45fps output = 0.222 (pop 1 every ~4.5 writes)
+                pop_rate = 10.0 / cfps
                 pop_accum = 0.0
                 next_time = time.monotonic()
                 last_log = time.monotonic()
