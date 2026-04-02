@@ -975,39 +975,42 @@ class CloudflareBroadcaster:
                 rq = self._raw_q
                 current_raw = None
                 interval = 1.0 / self.fps
-                while proc and proc.poll() is None and rq is not None:
-                    t0 = time.time()
-                    # Pick up latest raw frame if available
-                    try:
-                        current_raw = rq.get_nowait()
-                    except queue.Empty:
-                        pass
-                    if current_raw is None:
-                        time.sleep(interval)
-                        continue
-                    # Apply YOLO overlay onto raw frame
-                    with self._overlay_lock:
-                        ovl = self._overlay_ref[0]
-                    if ovl is not None:
-                        ovl_frame, ovl_mask = ovl
-                        raw_arr = np.frombuffer(current_raw, dtype=np.uint8).reshape(
-                            (self.height, self.width, 3)).copy()
-                        if ovl_frame.shape == raw_arr.shape:
-                            cv2.copyTo(ovl_frame, ovl_mask, raw_arr)
-                        frame_data = raw_arr.tobytes()
-                    else:
+                try:
+                    while proc and proc.poll() is None and rq is not None:
+                        t0 = time.time()
+                        # Pick up latest raw frame if available
+                        try:
+                            current_raw = rq.get_nowait()
+                        except queue.Empty:
+                            pass
+                        if current_raw is None:
+                            time.sleep(interval)
+                            continue
+                        # Apply YOLO overlay onto raw frame
                         frame_data = current_raw
-                    try:
-                        proc.stdin.write(frame_data)
-                    except (BrokenPipeError, IOError) as e:
-                        print(f"[CF Writer] pipe error: {e}")
-                        break
-                    except Exception as e:
-                        print(f"[CF Writer] unexpected error: {e}")
-                        break
-                    elapsed = time.time() - t0
-                    if elapsed < interval:
-                        time.sleep(interval - elapsed)
+                        try:
+                            with self._overlay_lock:
+                                ovl = self._overlay_ref[0]
+                            if ovl is not None:
+                                ovl_frame, ovl_mask = ovl
+                                raw_arr = np.frombuffer(current_raw, dtype=np.uint8).reshape(
+                                    (self.height, self.width, 3)).copy()
+                                if ovl_frame.shape == raw_arr.shape:
+                                    cv2.copyTo(ovl_frame, ovl_mask, raw_arr)
+                                frame_data = raw_arr.tobytes()
+                        except Exception as e:
+                            print(f"[CF Writer] overlay error (skipped): {e}")
+                            frame_data = current_raw  # fallback to raw
+                        try:
+                            proc.stdin.write(frame_data)
+                        except (BrokenPipeError, IOError) as e:
+                            print(f"[CF Writer] pipe error: {e}")
+                            break
+                        elapsed = time.time() - t0
+                        if elapsed < interval:
+                            time.sleep(interval - elapsed)
+                except Exception as e:
+                    print(f"[CF Writer] FATAL: {e}")
                 print("[CF Writer] thread exiting")
             self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
             self._writer_thread.start()
@@ -1026,8 +1029,15 @@ class CloudflareBroadcaster:
         """
         if not self.enabled or self._proc is None:
             return
+        # Auto-restart if ffmpeg died or writer thread died
+        needs_restart = False
         if self._proc.poll() is not None:
             print(f"[CF] ffmpeg exited (code={self._proc.returncode}), restarting...")
+            needs_restart = True
+        elif self._writer_thread is not None and not self._writer_thread.is_alive():
+            print("[CF] writer thread died, restarting...")
+            needs_restart = True
+        if needs_restart:
             self.start()
             if not self.enabled or self._proc is None:
                 return
