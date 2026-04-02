@@ -878,9 +878,10 @@ class CloudflareBroadcaster:
         self._frame_count = 0
         self._writer_thread = None
         self._alive = False
-        # Simple design: YOLO sends finished frame → writer repeats at 30fps
-        self._current_frame = None      # latest YOLO-annotated frame (bytes)
-        self._frame_lock = threading.Lock()
+        # Queue of YOLO-annotated frames (bytes). YOLO pushes ~3fps,
+        # writer pops and repeats each frame to fill 30fps.
+        # Large queue = buffer against stdin.write blocking.
+        self._frame_q = queue.Queue(maxsize=90)  # ~30s buffer at 3fps
 
         if self.enabled and not self.stream_key:
             print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
@@ -973,25 +974,37 @@ class CloudflareBroadcaster:
             except Exception as e:
                 print(f"[CF] pipe buffer resize failed (ok): {e}")
 
-            # Single writer thread: repeats latest YOLO frame at 30fps.
-            # YOLO sends a new frame every ~300ms via send_frame().
-            # Writer repeats it 10x to fill 30fps. Simple, smooth, no jitter.
+            # Writer thread: pops YOLO frames from queue, repeats each at 30fps.
+            # YOLO pushes ~3fps → each frame repeated ~10x to fill 30fps.
+            # Queue buffers ~30s of YOLO frames, so stdin.write blocking
+            # (even 2s) never causes stutter — plenty of frames waiting.
             self._alive = True
+            repeat_count = max(1, self.fps // 3)  # ~10 repeats per YOLO frame
             def _cf_writer():
                 proc = self._proc
+                fq = self._frame_q
                 interval = 1.0 / self.fps
+                current = None
+                repeats_left = 0
                 frame_n = 0
                 try:
                     while proc and proc.poll() is None and self._alive:
+                        # Get next YOLO frame when current exhausted
+                        if repeats_left <= 0:
+                            try:
+                                current = fq.get_nowait()
+                                repeats_left = repeat_count
+                            except queue.Empty:
+                                # No new frame — keep repeating current
+                                if current is None:
+                                    time.sleep(interval)
+                                    continue
+                                repeats_left = 1  # repeat once more
                         t0 = time.time()
-                        with self._frame_lock:
-                            data = self._current_frame
-                        if data is None:
-                            time.sleep(interval)
-                            continue
                         try:
-                            proc.stdin.write(data)
+                            proc.stdin.write(current)
                             frame_n += 1
+                            repeats_left -= 1
                         except (BrokenPipeError, IOError) as e:
                             print(f"[CF Writer] pipe error: {e}")
                             break
@@ -1000,7 +1013,7 @@ class CloudflareBroadcaster:
                             time.sleep(interval - elapsed)
                 except Exception as e:
                     print(f"[CF Writer] FATAL: {e}")
-                print(f"[CF Writer] exiting (wrote {frame_n} frames)")
+                print(f"[CF Writer] exiting (wrote {frame_n} frames, q={fq.qsize()})")
             self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
             self._writer_thread.start()
         except FileNotFoundError:
@@ -1011,10 +1024,10 @@ class CloudflareBroadcaster:
             self.enabled = False
 
     def send_frame(self, frame):
-        """Set the latest YOLO-annotated frame. Writer thread repeats it at 30fps.
+        """Push a YOLO-annotated frame into the queue. Never blocks main loop.
 
-        Called from main loop each time YOLO produces a new annotated frame (~3fps).
-        Writer thread repeats it ~10 times to fill 30fps. Never blocks.
+        Writer thread pops frames and repeats each ~10x to fill 30fps.
+        Queue buffers ~30s so stdin blocking never causes stream stutter.
         """
         if not self.enabled or self._proc is None:
             return
@@ -1035,8 +1048,10 @@ class CloudflareBroadcaster:
             frame = cv2.resize(frame, (self.width, self.height),
                                interpolation=cv2.INTER_LINEAR)
         data = frame.tobytes()
-        with self._frame_lock:
-            self._current_frame = data
+        try:
+            self._frame_q.put_nowait(data)
+        except queue.Full:
+            pass  # queue full — writer will catch up
         self._frame_count += 1
 
     def stop(self):
@@ -1047,7 +1062,12 @@ class CloudflareBroadcaster:
 
     def _stop_proc(self):
         self._alive = False
-        self._current_frame = None
+        # Drain queue
+        while not self._frame_q.empty():
+            try:
+                self._frame_q.get_nowait()
+            except queue.Empty:
+                break
         if self._proc is not None:
             try:
                 self._proc.stdin.close()
