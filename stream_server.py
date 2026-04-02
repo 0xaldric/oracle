@@ -1082,12 +1082,8 @@ class CloudflareBroadcaster:
 
     def _stop_proc(self):
         self._alive = False
-        # Drain queue
-        while not self._frame_q.empty():
-            try:
-                self._frame_q.get_nowait()
-            except queue.Empty:
-                break
+        with self._latest_lock:
+            self._latest_frame = None
         if self._proc is not None:
             try:
                 self._proc.stdin.close()
