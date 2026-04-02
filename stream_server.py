@@ -48,7 +48,7 @@ NEON_GREEN = (136, 255, 0)
 NEON_YELLOW = (0, 204, 255)
 
 # Output frame width — higher = better detection but larger JPEG
-OUTPUT_WIDTH = 1920
+OUTPUT_WIDTH = int(os.environ.get('OUTPUT_WIDTH', '1280'))
 
 
 class VehicleCounter:
@@ -100,8 +100,8 @@ class VehicleCounter:
         # Anti-double-count: recent crossing positions with timestamps
         # If a new ID crosses within DEDUP_RADIUS pixels of a recent crossing, skip it
         self._recent_crossings: list[tuple[int, int, float]] = []  # (cx, cy, time)
-        self.DEDUP_RADIUS = 60     # pixels — must be far enough from recent crossing
-        self.DEDUP_WINDOW = 3.0    # seconds — how long to remember a crossing
+        self.DEDUP_RADIUS = 35     # pixels — must be far enough from recent crossing
+        self.DEDUP_WINDOW = 1.5    # seconds — how long to remember a crossing
 
         # Per-class counts
         self.class_counts = {2: 0, 3: 0, 5: 0, 7: 0}
@@ -621,6 +621,14 @@ class CloudflareBroadcaster:
             print(f"[CF]   RTMPS: {self.rtmps_url}")
             print(f"[CF]   Video UID: {self.video_uid}")
 
+    def _check_nvenc(self):
+        """Check if NVENC hardware encoder is available."""
+        try:
+            r = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True, timeout=5)
+            return 'h264_nvenc' in r.stdout
+        except Exception:
+            return False
+
     def start(self):
         """Start ffmpeg subprocess for RTMPS streaming."""
         if not self.enabled:
@@ -628,26 +636,53 @@ class CloudflareBroadcaster:
         self._stop_proc()
 
         rtmps_dest = f"{self.rtmps_url}{self.stream_key}"
-        cmd = [
-            'ffmpeg',
-            '-y',                       # overwrite
-            '-f', 'rawvideo',           # input format: raw pixels
-            '-vcodec', 'rawvideo',
-            '-pix_fmt', 'bgr24',        # OpenCV default: BGR
-            '-s', f'{self.width}x{self.height}',
-            '-r', str(self.fps),        # input fps
-            '-i', '-',                  # read from stdin
-            '-c:v', 'libx264',          # encode H.264
-            '-preset', 'ultrafast',     # low latency
-            '-tune', 'zerolatency',     # no B-frames, low delay
-            '-pix_fmt', 'yuv420p',      # compatible output
-            '-g', str(self.fps * 2),    # keyframe every 2s
-            '-b:v', '2500k',           # bitrate
-            '-maxrate', '3000k',
-            '-bufsize', '6000k',
-            '-f', 'flv',               # FLV container for RTMP
-            rtmps_dest,
-        ]
+        # Try NVENC (GPU encoding) first, fall back to libx264
+        use_nvenc = self._check_nvenc()
+        if use_nvenc:
+            cmd = [
+                'ffmpeg',
+                '-y',
+                '-f', 'rawvideo',
+                '-vcodec', 'rawvideo',
+                '-pix_fmt', 'bgr24',
+                '-s', f'{self.width}x{self.height}',
+                '-r', str(self.fps),
+                '-i', '-',
+                '-c:v', 'h264_nvenc',       # GPU encoding
+                '-preset', 'p1',            # fastest NVENC preset
+                '-tune', 'll',              # low latency
+                '-rc', 'cbr',               # constant bitrate
+                '-pix_fmt', 'yuv420p',
+                '-g', str(self.fps * 2),
+                '-b:v', '2500k',
+                '-maxrate', '3000k',
+                '-bufsize', '1500k',        # smaller buffer = lower latency
+                '-f', 'flv',
+                rtmps_dest,
+            ]
+            print("[CF] Using NVENC (GPU) encoding")
+        else:
+            cmd = [
+                'ffmpeg',
+                '-y',
+                '-f', 'rawvideo',
+                '-vcodec', 'rawvideo',
+                '-pix_fmt', 'bgr24',
+                '-s', f'{self.width}x{self.height}',
+                '-r', str(self.fps),
+                '-i', '-',
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-pix_fmt', 'yuv420p',
+                '-g', str(self.fps * 2),
+                '-b:v', '2500k',
+                '-maxrate', '3000k',
+                '-bufsize', '1500k',
+                '-f', 'flv',
+                rtmps_dest,
+            ]
+            print("[CF] Using libx264 (CPU) encoding")
 
         try:
             self._proc = subprocess.Popen(
@@ -1223,7 +1258,7 @@ class StreamServer:
                 # ── Apply ROI mask for YOLO detection only ──
                 yolo_frame = self.apply_roi(frame)
 
-                # ── Process with YOLO (always — for visual annotations) ──
+                # ── Process with YOLO (every frame for accurate counting) ──
                 annotated, count = self.counter.process_frame(yolo_frame)
 
                 # ── Composite: overlay YOLO annotations onto original frame ──
@@ -1419,7 +1454,7 @@ def main():
     group.add_argument('--stream', '-s', help='Direct stream URL (HLS, RTSP, YouTube)')
     group.add_argument('--camera', help='Camera ID from cameras.json')
     parser.add_argument('--port', '-p', type=int, default=8765, help='WebSocket port')
-    parser.add_argument('--model', '-m', default=os.environ.get('YOLO_MODEL', 'yolo12s.pt'),
+    parser.add_argument('--model', '-m', default=os.environ.get('YOLO_MODEL', 'yolo12x.pt'),
                        help='YOLO model (yolo12n=fast, yolo12s=balanced, yolo12x=best)')
     parser.add_argument('--confidence', '-c', type=float, default=0.15, help='Detection confidence')
     parser.add_argument('--line', '-l', type=float, default=0.5, help='Counting line position (0-1)')
