@@ -1636,11 +1636,12 @@ class StreamServer:
                 except _queue.Empty:
                     continue
                 yolo_input = self.apply_roi(yf)
+                clean_input = yolo_input.copy()  # save before process_frame modifies in-place
                 annotated, cnt = self.counter.process_frame(yolo_input)
 
-                # Extract annotation overlay by diffing annotated vs input
-                # Pixels where annotated differs from input = annotations
-                diff_mask = cv2.absdiff(annotated, yolo_input)
+                # Extract annotation overlay by diffing annotated vs clean input
+                # process_frame draws on the input array in-place, so annotated IS yolo_input
+                diff_mask = cv2.absdiff(annotated, clean_input)
                 diff_gray = cv2.cvtColor(diff_mask, cv2.COLOR_BGR2GRAY)
                 _, overlay_mask = cv2.threshold(diff_gray, 5, 255, cv2.THRESH_BINARY)
                 # Dilate to cover anti-aliased edges
@@ -1711,16 +1712,13 @@ class StreamServer:
                     overlay_data = _yolo_overlay[0]  # (annotated_frame, mask) or None
 
                 # Composite: copy YOLO annotation pixels onto raw frame
-                display = frame.copy()
+                # frame is already a unique copy from reader, safe to modify in-place
+                display = frame
                 if overlay_data is not None:
                     ovl_frame, ovl_mask = overlay_data
                     if ovl_frame.shape == frame.shape:
-                        if self._roi_mask is not None:
-                            # Only apply overlay within ROI
-                            combined_mask = cv2.bitwise_and(ovl_mask, self._roi_mask[:, :, 0] if len(self._roi_mask.shape) == 3 else self._roi_mask)
-                            np.copyto(display, ovl_frame, where=combined_mask[:, :, np.newaxis] > 0)
-                        else:
-                            np.copyto(display, ovl_frame, where=ovl_mask[:, :, np.newaxis] > 0)
+                        # Use cv2.copyTo — faster than np.copyto with boolean mask
+                        cv2.copyTo(ovl_frame, ovl_mask, display)
 
                 # Broadcast vehicle_counted events
                 if self._round_active and hasattr(self, '_pending_vehicle_events'):
