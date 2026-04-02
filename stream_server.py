@@ -975,17 +975,19 @@ class CloudflareBroadcaster:
                 print(f"[CF] pipe buffer resize failed (ok): {e}")
 
             # Writer thread: pops YOLO frames from queue, repeats each to fill 30fps.
-            # NO sleep — pipe backpressure naturally throttles to ffmpeg's pace.
-            # When pipe is full, write() blocks until ffmpeg consumes → perfect sync.
+            # Uses monotonic clock to maintain exact 30fps pace.
+            # write() may block (pipe full) — that's fine, clock catches up after.
             # Queue buffers ~30s of YOLO frames for resilience.
             self._alive = True
             repeat_count = max(1, self.fps // 3)  # ~10 repeats per YOLO frame
             def _cf_writer():
                 proc = self._proc
                 fq = self._frame_q
+                interval = 1.0 / self.fps
                 current = None
                 repeats_left = 0
                 frame_n = 0
+                next_time = time.monotonic()
                 try:
                     while proc and proc.poll() is None and self._alive:
                         # Get next YOLO frame when current exhausted
@@ -996,11 +998,19 @@ class CloudflareBroadcaster:
                             except queue.Empty:
                                 if current is None:
                                     time.sleep(0.03)
+                                    next_time = time.monotonic()
                                     continue
                                 repeats_left = 1
+                        # Wait until next frame time
+                        now = time.monotonic()
+                        wait = next_time - now
+                        if wait > 0:
+                            time.sleep(wait)
+                        next_time += interval
+                        # Prevent drift: if we fell behind, reset clock
+                        if time.monotonic() - next_time > 1.0:
+                            next_time = time.monotonic()
                         try:
-                            # write() blocks when pipe full — this IS the throttle.
-                            # ffmpeg consumes at exactly 30fps encode rate.
                             proc.stdin.write(current)
                             frame_n += 1
                             repeats_left -= 1
