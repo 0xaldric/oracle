@@ -1712,10 +1712,12 @@ class StreamServer:
                             })
 
                 # ── Get frame ────────────────────────────────────────
+                _t0 = time.monotonic()
                 try:
                     frame = _frame_q.get(timeout=0.1)
                 except _queue.Empty:
                     continue
+                _t_get = time.monotonic()
 
                 frame_idx += 1
 
@@ -1744,6 +1746,7 @@ class StreamServer:
                         bg = cv2.bitwise_and(frame, roi_inv)
                         fg = cv2.bitwise_and(display, self._roi_mask)
                         display = cv2.add(bg, fg)
+                _t_proc = time.monotonic()
 
                 # Broadcast vehicle_counted events
                 if self._round_active and hasattr(self, '_pending_vehicle_events'):
@@ -1764,8 +1767,13 @@ class StreamServer:
                 cv2.putText(display, dbg, (w_d - 420, h_d - 8),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 136), 1)
 
-                # Send YOLO-annotated frame to CF — writer repeats at 30fps
+                # Send YOLO-annotated frame to CF
                 self._cf.send_frame(display)
+                _t_cf = time.monotonic()
+
+                # Debug timing every 5s
+                if frame_idx % 150 == 0:
+                    print(f"[MainLoop] get={(_t_get-_t0)*1000:.0f}ms proc={(_t_proc-_t_get)*1000:.0f}ms cf={(_t_cf-_t_proc)*1000:.0f}ms total={(_t_cf-_t0)*1000:.0f}ms")
 
                 # WS: JSON-only state updates at 1Hz
                 now = time.time()
