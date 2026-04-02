@@ -1154,11 +1154,20 @@ class StreamServer:
                     frame = cv2.resize(frame, (OUTPUT_WIDTH, int(h * scale)),
                                       interpolation=cv2.INTER_LINEAR)
 
-                # ── Apply ROI mask (black out non-detection areas) ──
+                # ── Apply ROI mask for YOLO detection only ──
                 yolo_frame = self.apply_roi(frame)
 
                 # ── Process with YOLO (always — for visual annotations) ──
                 annotated, count = self.counter.process_frame(yolo_frame)
+
+                # ── Composite: overlay YOLO annotations onto original frame ──
+                # (so Cloudflare stream shows full camera view, not black ROI mask)
+                if self._roi_mask is not None:
+                    # Where ROI mask is black (0), use original frame pixels
+                    roi_inv = cv2.bitwise_not(self._roi_mask)
+                    bg = cv2.bitwise_and(frame, roi_inv)       # original pixels outside ROI
+                    fg = cv2.bitwise_and(annotated, self._roi_mask)  # annotated pixels inside ROI
+                    annotated = cv2.add(bg, fg)
 
                 # ── Broadcast discrete vehicle_counted events (if any) ──
                 if self._round_active and hasattr(self, '_pending_vehicle_events'):
