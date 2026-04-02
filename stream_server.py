@@ -1097,12 +1097,26 @@ class StreamServer:
         self._evidence_hashes.append(frame_hash)
         print(f"[Evidence] Saved {rel_path} ({len(jpeg_bytes)} bytes, {frame_hash[:20]}...)")
 
-    async def process_video(self):
-        """Main video processing loop — runs FOREVER.
+    def _video_pipeline(self, loop):
+        """Video processing pipeline — runs in a SEPARATE THREAD.
 
-        Streams video continuously. Counting controlled by _round_active flag
-        which is set by start_round/stop_round WS messages from round_manager.
+        All CV2/YOLO/ffmpeg work happens here so the asyncio event loop
+        stays free to manage WebSocket connections without CLOSE-WAIT buildup.
         """
+        import queue as _queue
+
+        while True:
+            try:
+                self._run_video_pipeline(loop, _queue)
+            except Exception as e:
+                print(f"\n[RESTART] Video pipeline crashed: {e}")
+                import traceback
+                traceback.print_exc()
+                print("[RESTART] Restarting pipeline in 5s...")
+                time.sleep(5)
+
+    def _run_video_pipeline(self, loop, _queue):
+        """Single run of the video pipeline. Raises on error for auto-restart."""
         direct_url = get_stream_url(self.stream_url)
 
         print(f"\n[Stream] Opening video...")
@@ -1110,7 +1124,7 @@ class StreamServer:
 
         if not cap.isOpened():
             print("[ERROR] Could not open video stream!")
-            return
+            raise RuntimeError("Could not open video stream")
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
 
@@ -1120,7 +1134,6 @@ class StreamServer:
 
         # Start Cloudflare broadcast if enabled
         if self._cf.enabled:
-            # Get actual frame dimensions for ffmpeg
             ret_test, frame_test = cap.read()
             if ret_test and frame_test is not None:
                 h_t, w_t = frame_test.shape[:2]
@@ -1132,28 +1145,22 @@ class StreamServer:
                 self._cf.width = OUTPUT_WIDTH
                 self._cf.height = out_h
                 self._cf.start()
-                # Put the test frame back (we don't want to lose it)
-                # We can't un-read it, so we just start from the next frame
 
         self.running = True
         frame_idx = 0
         frame_interval = 1.0 / self.target_fps
         server_start = time.time()
 
-        # Reader thread — prevents cap.read() from blocking event loop
+        # Reader thread
         import threading
-        import queue as _queue
         _frame_q = _queue.Queue(maxsize=2)
         _reader_alive = [True]
         _cap_holder = [cap]
         _last_frame_time = [time.time()]
-
-        # Camera switch event — set by _switch_camera() to trigger reconnect
         self._switch_event = threading.Event()
 
         def _reader():
             while _reader_alive[0]:
-                # Check if camera switch was requested
                 if self._switch_event.is_set():
                     self._switch_event.clear()
                     print("[Reader] Camera switch — reconnecting to new stream...")
@@ -1163,7 +1170,6 @@ class StreamServer:
                             c.release()
                     except Exception:
                         pass
-                    # Drain frame queue
                     while not _frame_q.empty():
                         try:
                             _frame_q.get_nowait()
@@ -1206,10 +1212,9 @@ class StreamServer:
 
         threading.Thread(target=_reader, daemon=True).start()
 
-        # ── YOLO inference thread — runs independently at ~11fps ──
-        # Main loop runs at full stream FPS (~60), overlays latest YOLO result
-        _yolo_q = _queue.Queue(maxsize=1)       # latest frame for YOLO
-        _yolo_result = [None, 0]                 # [annotated_overlay, count]
+        # YOLO inference thread
+        _yolo_q = _queue.Queue(maxsize=1)
+        _yolo_result = [None, 0]
         _yolo_lock = threading.Lock()
 
         def _yolo_worker():
@@ -1220,12 +1225,18 @@ class StreamServer:
                     continue
                 yolo_input = self.apply_roi(yf)
                 annotated, cnt = self.counter.process_frame(yolo_input)
-                # Extract annotation overlay (difference between annotated and yolo_input)
                 with _yolo_lock:
                     _yolo_result[0] = annotated
                     _yolo_result[1] = cnt
 
         threading.Thread(target=_yolo_worker, daemon=True).start()
+
+        # Helper: thread-safe broadcast via asyncio event loop
+        def _safe_broadcast(msg_dict):
+            """Schedule a WS broadcast on the asyncio event loop (non-blocking)."""
+            asyncio.run_coroutine_threadsafe(self._broadcast_json(msg_dict), loop)
+
+        last_ws_time = 0
 
         try:
             while self.running:
@@ -1235,11 +1246,9 @@ class StreamServer:
                 if self._round_active:
                     round_elapsed = frame_start - self._round_start_time
                     if round_elapsed >= self._round_duration:
-                        # Round complete — stop counting, write result
                         result = self._stop_round()
-                        # Broadcast final + round_complete to all clients
                         if result:
-                            await self._broadcast_json({
+                            _safe_broadcast({
                                 "type": "final",
                                 "count": result["count"],
                                 "in_count": result.get("in_count", 0),
@@ -1247,16 +1256,15 @@ class StreamServer:
                                 "duration": result["duration"],
                                 "marketAddress": result.get("marketAddress", ""),
                             })
-                            await self._broadcast_json({
+                            _safe_broadcast({
                                 "type": "round_complete",
                                 **result,
                             })
 
                 # ── Get frame ────────────────────────────────────────
                 try:
-                    frame = _frame_q.get_nowait()
+                    frame = _frame_q.get(timeout=0.1)
                 except _queue.Empty:
-                    await asyncio.sleep(0.005)
                     continue
 
                 frame_idx += 1
@@ -1268,34 +1276,32 @@ class StreamServer:
                     frame = cv2.resize(frame, (OUTPUT_WIDTH, int(h * scale)),
                                       interpolation=cv2.INTER_LINEAR)
 
-                # ── Feed frame to YOLO thread (non-blocking, drop if busy) ──
+                # Feed frame to YOLO thread
                 try:
                     _yolo_q.put_nowait(frame.copy())
                 except _queue.Full:
-                    pass  # YOLO still processing previous frame, skip
+                    pass
 
-                # ── Use latest YOLO result for display ──
+                # Use latest YOLO result
                 with _yolo_lock:
                     annotated = _yolo_result[0] if _yolo_result[0] is not None else frame
                     count = _yolo_result[1]
 
-                # ── Composite: overlay YOLO annotations onto original frame ──
-                # If YOLO result size matches current frame, blend annotations
+                # Composite
                 if annotated is not frame and annotated.shape == frame.shape:
                     if self._roi_mask is not None:
                         roi_inv = cv2.bitwise_not(self._roi_mask)
                         bg = cv2.bitwise_and(frame, roi_inv)
                         fg = cv2.bitwise_and(annotated, self._roi_mask)
                         annotated = cv2.add(bg, fg)
-                    # Use YOLO-annotated frame (has boxes, lines, counts)
                     display = annotated
                 else:
                     display = frame
 
-                # ── Broadcast discrete vehicle_counted events (if any) ──
+                # Broadcast vehicle_counted events
                 if self._round_active and hasattr(self, '_pending_vehicle_events'):
                     for evt in self._pending_vehicle_events:
-                        await self._broadcast_json(evt)
+                        _safe_broadcast(evt)
                     self._pending_vehicle_events.clear()
 
                 # Debug overlay
@@ -1311,19 +1317,16 @@ class StreamServer:
                 cv2.putText(display, dbg, (w_d - 420, h_d - 8),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 136), 1)
 
-                # ── Pipe frame to Cloudflare Stream at FULL FPS ────────
+                # Pipe frame to Cloudflare Stream
                 self._cf.send_frame(display)
 
-                # ── WS: JSON-only state updates at 1Hz (no binary frames) ──
-                # Video goes through Cloudflare Stream; WS is for lightweight control only
-                _ws_now = time.time()
-                if not hasattr(self, '_last_ws_broadcast'):
-                    self._last_ws_broadcast = 0
-                if _ws_now - self._last_ws_broadcast >= 1.0:
-                    self._last_ws_broadcast = _ws_now
+                # WS: JSON-only state updates at 1Hz
+                now = time.time()
+                if now - last_ws_time >= 1.0:
+                    last_ws_time = now
                     _video_uid_field = {"videoUid": self._cf.video_uid} if self._cf.video_uid else {}
                     if self._round_active:
-                        round_elapsed = _ws_now - self._round_start_time
+                        round_elapsed = now - self._round_start_time
                         msg = {
                             "type": "count",
                             "state": "counting",
@@ -1345,9 +1348,9 @@ class StreamServer:
                             "cameraId": self.camera_id,
                             **_video_uid_field,
                         }
-                    await self._broadcast_json(msg)
+                    _safe_broadcast(msg)
 
-                # ── Evidence capture (only during round) ─────────────
+                # Evidence capture
                 if self._round_active:
                     round_elapsed = time.time() - self._round_start_time
                     round_ts = int(self._round_start_time)
@@ -1357,24 +1360,17 @@ class StreamServer:
                     if self._round_duration - round_elapsed < frame_interval * 2:
                         self._save_evidence_frame(display, round_ts, round_elapsed, is_final=True)
 
-                # ── FPS throttle — match target FPS ──
+                # FPS throttle
                 elapsed = time.time() - frame_start
                 sleep_time = frame_interval - elapsed
                 if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
-                else:
-                    await asyncio.sleep(0)
+                    time.sleep(sleep_time)
 
-        except Exception as e:
-            print(f"\n[ERROR] process_video: {e}")
-            import traceback
-            traceback.print_exc()
         finally:
             _reader_alive[0] = False
             if _cap_holder[0] is not None:
                 _cap_holder[0].release()
             self._cf.stop()
-            # Don't set self.running = False — let outer loop restart us
 
     async def handler(self, ws):
         accepted = await self.register(ws)
@@ -1445,21 +1441,25 @@ class StreamServer:
             print(f"  CF Broadcast: OFF")
         print(f"{'='*55}\n")
 
+        import threading
+        loop = asyncio.get_event_loop()
+
+        # Start video pipeline in a separate thread — keeps event loop free for WS
+        video_thread = threading.Thread(
+            target=self._video_pipeline, args=(loop,), daemon=True
+        )
+        video_thread.start()
+        print("[Server] Video pipeline started in background thread")
+
+        # WS server runs on the asyncio event loop — never blocked by video
         async with websockets.serve(
             self.handler, self.host, self.port,
             ping_interval=30,
             ping_timeout=60,
         ):
-            # Keep WS server alive forever — restart process_video on crash
+            # Keep event loop alive forever
             while True:
-                try:
-                    await self.process_video()
-                except Exception as e:
-                    print(f"\n[RESTART] process_video crashed: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    print("[RESTART] Restarting in 5s...")
-                    await asyncio.sleep(5)
+                await asyncio.sleep(1)
 
 
 def load_camera(camera_id):
