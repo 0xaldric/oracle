@@ -1191,7 +1191,11 @@ class StreamServer:
                             c.release()
                         new_url = get_stream_url(self.stream_url, force_refresh=_force_refresh[0])
                         _force_refresh[0] = False
-                        _cap_holder[0] = cv2.VideoCapture(new_url)
+                        new_cap = cv2.VideoCapture(new_url)
+                        # Set timeouts to prevent blocking forever on bad streams
+                        new_cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)
+                        new_cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+                        _cap_holder[0] = new_cap
                         _last_frame_time[0] = time.time()
                         print("[Reader] Reconnected")
                     except Exception as e:
@@ -1207,8 +1211,8 @@ class StreamServer:
                     except _queue.Full:
                         pass
                 else:
-                    if time.time() - _last_frame_time[0] > 10:
-                        print("[Reader] No frames 10s — forcing reconnect")
+                    if time.time() - _last_frame_time[0] > 5:
+                        print("[Reader] No frames 5s — forcing reconnect")
                         try:
                             c.release()
                         except Exception:
