@@ -989,6 +989,7 @@ class CloudflareBroadcaster:
             # Result: perfectly smooth 45fps, content updates ~12fps evenly.
             self._alive = True
             TARGET_Q = 1080      # target queue depth (~3 min at 6fps YOLO)
+            MIN_Q_START = 360    # don't start playing until queue has 1 min buffer
             def _cf_writer():
                 proc = self._proc
                 fq = self._frame_q
@@ -1004,7 +1005,45 @@ class CloudflareBroadcaster:
                 next_time = time.monotonic()
                 last_log = time.monotonic()
                 last_adjust = time.monotonic()
+                buffering = True
+
                 try:
+                    # Phase 1: Buffer — wait until queue has MIN_Q_START frames
+                    print(f"[CF Writer] buffering... waiting for {MIN_Q_START} frames")
+                    while proc and proc.poll() is None and self._alive and buffering:
+                        qs = fq.qsize()
+                        if qs >= MIN_Q_START:
+                            buffering = False
+                            print(f"[CF Writer] buffer ready ({qs} frames), starting playback")
+                            break
+                        # Feed a black/hold frame to keep ffmpeg alive
+                        if current is None:
+                            try:
+                                current = fq.get(timeout=1)
+                                new_count += 1
+                            except queue.Empty:
+                                continue
+                        now = time.monotonic()
+                        wait = next_time - now
+                        if wait > 0:
+                            time.sleep(wait)
+                        next_time += interval
+                        if time.monotonic() - next_time > 1.0:
+                            next_time = time.monotonic()
+                        try:
+                            proc.stdin.write(current)
+                            frame_n += 1
+                        except (BrokenPipeError, IOError) as e:
+                            print(f"[CF Writer] pipe error during buffer: {e}")
+                            break
+                        # Log during buffering
+                        now_m = time.monotonic()
+                        if now_m - last_log >= 5.0:
+                            last_log = now_m
+                            print(f"[CF Writer] buffering... q={qs}/{MIN_Q_START}")
+
+                    # Phase 2: Playback — smooth adaptive consumption
+                    next_time = time.monotonic()
                     while proc and proc.poll() is None and self._alive:
                         # Fractional pop: accumulate and pop when >= 1.0
                         pop_accum += pop_rate
@@ -1021,7 +1060,6 @@ class CloudflareBroadcaster:
                                     next_time = time.monotonic()
                                     continue
                         elif current is None:
-                            # No frame yet at all — wait for first frame
                             try:
                                 current = fq.get(timeout=0.1)
                                 new_count += 1
@@ -1047,14 +1085,14 @@ class CloudflareBroadcaster:
                             last_adjust = now_m
                             qs = fq.qsize()
                             if qs > TARGET_Q + 30:
-                                pop_rate = min(0.5, pop_rate + 0.01)   # consume faster
+                                pop_rate = min(0.5, pop_rate + 0.005)   # consume faster
                             elif qs < TARGET_Q - 30:
-                                pop_rate = max(0.1, pop_rate - 0.01)   # consume slower
-                        # Debug every 5s
-                        if now_m - last_log >= 5.0:
+                                pop_rate = max(0.05, pop_rate - 0.005)  # consume slower
+                        # Debug every 10s
+                        if now_m - last_log >= 10.0:
                             last_log = now_m
                             qs = fq.qsize()
-                            ufps = new_count / 5.0
+                            ufps = new_count / 10.0
                             print(f"[CF Writer] frames={frame_n} new={new_count}({ufps:.1f}fps) hold={hold_count} q={qs} rate={pop_rate:.3f}")
                             new_count = 0
                             hold_count = 0
