@@ -979,16 +979,23 @@ class CloudflareBroadcaster:
                 buf = self._buf
                 interval = 1.0 / self.fps
                 has_frame = False
+                frame_n = 0
+                slow_count = 0
+                t_copy_sum = 0
+                t_ovl_sum = 0
+                t_write_sum = 0
+                t_total_sum = 0
                 try:
                     while proc and proc.poll() is None and self._alive:
                         t0 = time.time()
-                        # Grab latest raw frame (lock-free read of reference)
+                        # Grab latest raw frame
                         with self._frame_lock:
                             raw = self._latest_frame
                         if raw is None:
                             time.sleep(interval)
                             continue
                         # Copy raw frame into pre-allocated buffer
+                        t1 = time.time()
                         try:
                             if raw.shape == buf.shape:
                                 np.copyto(buf, raw)
@@ -1000,6 +1007,7 @@ class CloudflareBroadcaster:
                             if not has_frame:
                                 time.sleep(interval)
                                 continue
+                        t2 = time.time()
                         # Apply YOLO overlay in-place on buffer
                         try:
                             with self._overlay_lock:
@@ -1010,15 +1018,34 @@ class CloudflareBroadcaster:
                                     cv2.copyTo(ovl_frame, ovl_mask, buf)
                         except Exception as e:
                             print(f"[CF Writer] overlay error (skipped): {e}")
-                        # Write to ffmpeg — single tobytes(), no extra copies
+                        t3 = time.time()
+                        # Write to ffmpeg
                         try:
                             proc.stdin.write(buf.tobytes())
                         except (BrokenPipeError, IOError) as e:
                             print(f"[CF Writer] pipe error: {e}")
                             break
-                        elapsed = time.time() - t0
-                        if elapsed < interval:
-                            time.sleep(interval - elapsed)
+                        t4 = time.time()
+                        # Timing stats
+                        frame_n += 1
+                        dt_copy = t2 - t1
+                        dt_ovl = t3 - t2
+                        dt_write = t4 - t3
+                        dt_total = t4 - t0
+                        t_copy_sum += dt_copy
+                        t_ovl_sum += dt_ovl
+                        t_write_sum += dt_write
+                        t_total_sum += dt_total
+                        if dt_total > interval * 1.5:
+                            slow_count += 1
+                            print(f"[CF Writer] SLOW frame {frame_n}: copy={dt_copy*1000:.1f}ms ovl={dt_ovl*1000:.1f}ms write={dt_write*1000:.1f}ms total={dt_total*1000:.1f}ms")
+                        if frame_n % 300 == 0:
+                            n = 300
+                            print(f"[CF Writer] avg/300: copy={t_copy_sum/n*1000:.1f}ms ovl={t_ovl_sum/n*1000:.1f}ms write={t_write_sum/n*1000:.1f}ms total={t_total_sum/n*1000:.1f}ms slow={slow_count}")
+                            t_copy_sum = t_ovl_sum = t_write_sum = t_total_sum = 0
+                            slow_count = 0
+                        if dt_total < interval:
+                            time.sleep(interval - dt_total)
                 except Exception as e:
                     print(f"[CF Writer] FATAL: {e}")
                 print("[CF Writer] thread exiting")
