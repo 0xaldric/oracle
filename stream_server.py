@@ -1214,6 +1214,27 @@ class StreamServer:
 
         threading.Thread(target=_reader, daemon=True).start()
 
+        # ── YOLO inference thread — runs independently at ~11fps ──
+        # Main loop runs at full stream FPS (~60), overlays latest YOLO result
+        _yolo_q = _queue.Queue(maxsize=1)       # latest frame for YOLO
+        _yolo_result = [None, 0]                 # [annotated_overlay, count]
+        _yolo_lock = threading.Lock()
+
+        def _yolo_worker():
+            while _reader_alive[0]:
+                try:
+                    yf = _yolo_q.get(timeout=1)
+                except _queue.Empty:
+                    continue
+                yolo_input = self.apply_roi(yf)
+                annotated, cnt = self.counter.process_frame(yolo_input)
+                # Extract annotation overlay (difference between annotated and yolo_input)
+                with _yolo_lock:
+                    _yolo_result[0] = annotated
+                    _yolo_result[1] = cnt
+
+        threading.Thread(target=_yolo_worker, daemon=True).start()
+
         try:
             while self.running:
                 frame_start = time.time()
@@ -1243,7 +1264,7 @@ class StreamServer:
                 try:
                     frame = _frame_q.get_nowait()
                 except _queue.Empty:
-                    await asyncio.sleep(0.02)
+                    await asyncio.sleep(0.005)
                     continue
 
                 frame_idx += 1
@@ -1255,20 +1276,29 @@ class StreamServer:
                     frame = cv2.resize(frame, (OUTPUT_WIDTH, int(h * scale)),
                                       interpolation=cv2.INTER_LINEAR)
 
-                # ── Apply ROI mask for YOLO detection only ──
-                yolo_frame = self.apply_roi(frame)
+                # ── Feed frame to YOLO thread (non-blocking, drop if busy) ──
+                try:
+                    _yolo_q.put_nowait(frame.copy())
+                except _queue.Full:
+                    pass  # YOLO still processing previous frame, skip
 
-                # ── Process with YOLO (every frame for accurate counting) ──
-                annotated, count = self.counter.process_frame(yolo_frame)
+                # ── Use latest YOLO result for display ──
+                with _yolo_lock:
+                    annotated = _yolo_result[0] if _yolo_result[0] is not None else frame
+                    count = _yolo_result[1]
 
                 # ── Composite: overlay YOLO annotations onto original frame ──
-                # (so Cloudflare stream shows full camera view, not black ROI mask)
-                if self._roi_mask is not None:
-                    # Where ROI mask is black (0), use original frame pixels
-                    roi_inv = cv2.bitwise_not(self._roi_mask)
-                    bg = cv2.bitwise_and(frame, roi_inv)       # original pixels outside ROI
-                    fg = cv2.bitwise_and(annotated, self._roi_mask)  # annotated pixels inside ROI
-                    annotated = cv2.add(bg, fg)
+                # If YOLO result size matches current frame, blend annotations
+                if annotated is not frame and annotated.shape == frame.shape:
+                    if self._roi_mask is not None:
+                        roi_inv = cv2.bitwise_not(self._roi_mask)
+                        bg = cv2.bitwise_and(frame, roi_inv)
+                        fg = cv2.bitwise_and(annotated, self._roi_mask)
+                        annotated = cv2.add(bg, fg)
+                    # Use YOLO-annotated frame (has boxes, lines, counts)
+                    display = annotated
+                else:
+                    display = frame
 
                 # ── Broadcast discrete vehicle_counted events (if any) ──
                 if self._round_active and hasattr(self, '_pending_vehicle_events'):
@@ -1285,16 +1315,16 @@ class StreamServer:
                     dbg = f"{state_tag} seq:{frame_idx} fps:{fps_actual:.1f} round:{self._round_id} {re}s"
                 else:
                     dbg = f"{state_tag} seq:{frame_idx} fps:{fps_actual:.1f}"
-                h_ann, w_ann = annotated.shape[:2]
-                cv2.putText(annotated, dbg, (w_ann - 420, h_ann - 8),
+                h_d, w_d = display.shape[:2]
+                cv2.putText(display, dbg, (w_d - 420, h_d - 8),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 136), 1)
 
                 # Encode JPEG
-                _, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                _, jpeg = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 65])
                 jpeg_bytes = jpeg.tobytes()
 
-                # ── Pipe annotated frame to Cloudflare Stream ────────
-                self._cf.send_frame(annotated)
+                # ── Pipe frame to Cloudflare Stream at FULL FPS ────────
+                self._cf.send_frame(display)
 
                 # ── Broadcast based on state ─────────────────────────
                 _video_uid_field = {"videoUid": self._cf.video_uid} if self._cf.video_uid else {}
@@ -1329,13 +1359,18 @@ class StreamServer:
                     round_elapsed = time.time() - self._round_start_time
                     round_ts = int(self._round_start_time)
                     if round_elapsed - self._last_evidence_time >= self.EVIDENCE_INTERVAL:
-                        self._save_evidence_frame(annotated, round_ts, round_elapsed)
+                        self._save_evidence_frame(display, round_ts, round_elapsed)
                         self._last_evidence_time = round_elapsed
                     if self._round_duration - round_elapsed < frame_interval * 2:
-                        self._save_evidence_frame(annotated, round_ts, round_elapsed, is_final=True)
+                        self._save_evidence_frame(display, round_ts, round_elapsed, is_final=True)
 
-                # Yield to event loop
-                await asyncio.sleep(0)
+                # ── FPS throttle — match target FPS ──
+                elapsed = time.time() - frame_start
+                sleep_time = frame_interval - elapsed
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                else:
+                    await asyncio.sleep(0)
 
         except Exception as e:
             print(f"\n[ERROR] {e}")
