@@ -973,29 +973,32 @@ class CloudflareBroadcaster:
             # applies YOLO overlay using pre-allocated buffer, writes at exact 30fps.
             # Zero unnecessary memory allocation = smooth streaming.
             self._buf = np.empty((self.height, self.width, 3), dtype=np.uint8)
+            self._prepared = [None]  # latest prepared frame bytes, ready for stdin
+            self._prepared_lock = threading.Lock()
             self._alive = True
-            def _cf_writer():
-                proc = self._proc
+
+            # Increase pipe buffer to reduce write blocking
+            try:
+                import fcntl
+                F_SETPIPE_SZ = 1031
+                pipe_sz = fcntl.fcntl(self._proc.stdin.fileno(), F_SETPIPE_SZ, 1048576)
+                print(f"[CF] pipe buffer set to {pipe_sz} bytes")
+            except Exception as e:
+                print(f"[CF] pipe buffer resize failed (ok): {e}")
+
+            # Thread 1: Prepare frames at exact 30fps (copy + overlay → bytes)
+            def _cf_prepare():
                 buf = self._buf
                 interval = 1.0 / self.fps
                 has_frame = False
-                frame_n = 0
-                slow_count = 0
-                t_copy_sum = 0
-                t_ovl_sum = 0
-                t_write_sum = 0
-                t_total_sum = 0
                 try:
-                    while proc and proc.poll() is None and self._alive:
+                    while self._alive:
                         t0 = time.time()
-                        # Grab latest raw frame
                         with self._frame_lock:
                             raw = self._latest_frame
                         if raw is None:
                             time.sleep(interval)
                             continue
-                        # Copy raw frame into pre-allocated buffer
-                        t1 = time.time()
                         try:
                             if raw.shape == buf.shape:
                                 np.copyto(buf, raw)
@@ -1007,8 +1010,6 @@ class CloudflareBroadcaster:
                             if not has_frame:
                                 time.sleep(interval)
                                 continue
-                        t2 = time.time()
-                        # Apply YOLO overlay in-place on buffer
                         try:
                             with self._overlay_lock:
                                 ovl = self._overlay_ref[0]
@@ -1016,39 +1017,39 @@ class CloudflareBroadcaster:
                                 ovl_frame, ovl_mask = ovl
                                 if ovl_frame.shape == buf.shape:
                                     cv2.copyTo(ovl_frame, ovl_mask, buf)
-                        except Exception as e:
-                            print(f"[CF Writer] overlay error (skipped): {e}")
-                        t3 = time.time()
-                        # Write to ffmpeg
+                        except Exception:
+                            pass
+                        frame_bytes = buf.tobytes()
+                        with self._prepared_lock:
+                            self._prepared[0] = frame_bytes
+                        elapsed = time.time() - t0
+                        if elapsed < interval:
+                            time.sleep(interval - elapsed)
+                except Exception as e:
+                    print(f"[CF Prepare] FATAL: {e}")
+                print("[CF Prepare] thread exiting")
+
+            # Thread 2: Write to ffmpeg stdin as fast as pipe allows (can block freely)
+            def _cf_writer():
+                proc = self._proc
+                frame_n = 0
+                try:
+                    while proc and proc.poll() is None and self._alive:
+                        with self._prepared_lock:
+                            data = self._prepared[0]
+                        if data is None:
+                            time.sleep(0.01)
+                            continue
                         try:
-                            proc.stdin.write(buf.tobytes())
+                            proc.stdin.write(data)
+                            frame_n += 1
                         except (BrokenPipeError, IOError) as e:
                             print(f"[CF Writer] pipe error: {e}")
                             break
-                        t4 = time.time()
-                        # Timing stats
-                        frame_n += 1
-                        dt_copy = t2 - t1
-                        dt_ovl = t3 - t2
-                        dt_write = t4 - t3
-                        dt_total = t4 - t0
-                        t_copy_sum += dt_copy
-                        t_ovl_sum += dt_ovl
-                        t_write_sum += dt_write
-                        t_total_sum += dt_total
-                        if dt_total > interval * 1.5:
-                            slow_count += 1
-                            print(f"[CF Writer] SLOW frame {frame_n}: copy={dt_copy*1000:.1f}ms ovl={dt_ovl*1000:.1f}ms write={dt_write*1000:.1f}ms total={dt_total*1000:.1f}ms")
-                        if frame_n % 300 == 0:
-                            n = 300
-                            print(f"[CF Writer] avg/300: copy={t_copy_sum/n*1000:.1f}ms ovl={t_ovl_sum/n*1000:.1f}ms write={t_write_sum/n*1000:.1f}ms total={t_total_sum/n*1000:.1f}ms slow={slow_count}")
-                            t_copy_sum = t_ovl_sum = t_write_sum = t_total_sum = 0
-                            slow_count = 0
-                        if dt_total < interval:
-                            time.sleep(interval - dt_total)
                 except Exception as e:
                     print(f"[CF Writer] FATAL: {e}")
-                print("[CF Writer] thread exiting")
+                print(f"[CF Writer] thread exiting (wrote {frame_n} frames)")
+            threading.Thread(target=_cf_prepare, daemon=True, name="cf-prepare").start()
             self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
             self._writer_thread.start()
         except FileNotFoundError:
