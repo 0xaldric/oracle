@@ -844,8 +844,53 @@ class StreamServer:
         c.model = self.counter.model  # reuse loaded model — no GPU reload
         return c
 
+    def _switch_camera(self, new_camera_id):
+        """Switch to a different camera. Updates stream URL, line points, ROI, and signals reader to reconnect."""
+        from pathlib import Path
+        cameras_path = Path(__file__).parent / "cameras.json"
+        with open(cameras_path) as f:
+            data = json.load(f)
+        cam = None
+        for c in data["cameras"]:
+            if c["id"] == new_camera_id:
+                cam = c
+                break
+        if not cam:
+            print(f"[SWITCH] Camera '{new_camera_id}' not found — staying on {self.camera_id}")
+            return
+        old_id = self.camera_id
+        self.camera_id = cam["id"]
+        self.stream_url = cam.get("streamUrl", cam.get("imageUrl"))
+
+        # Update line points
+        self._line_points = cam.get("linePoints")
+        self._line_points2 = cam.get("linePoints2")
+        self._count_mode = "line" if self._line_points else "uid"
+        self._lanes = cam.get("lanes")
+
+        # Update ROI
+        self._roi_polygons = cam.get("roi")
+        self._roi_mask = None  # force rebuild on next frame
+
+        # Signal reader thread to reconnect to new stream
+        if hasattr(self, '_switch_event'):
+            self._switch_event.set()
+
+        print(f"[SWITCH] Camera: {old_id} -> {cam['id']} ({cam['name']})")
+        if self._line_points:
+            print(f"[SWITCH] Line: {self._line_points}")
+        if self._line_points2:
+            print(f"[SWITCH] Line2: {self._line_points2}")
+        if self._roi_polygons:
+            print(f"[SWITCH] ROI: {len(self._roi_polygons)} points")
+
     def _start_round(self, data):
         """Begin a new counting round. All state is clean."""
+        # Check if we need to switch cameras
+        requested_camera = data.get("cameraId", "")
+        if requested_camera and requested_camera != self.camera_id:
+            self._switch_camera(requested_camera)
+
         self._round_market = data.get("marketAddress", "")
         self._round_duration = data.get("duration", 300)
         self._round_id = data.get("roundId", 0)
@@ -1076,8 +1121,29 @@ class StreamServer:
         _cap_holder = [cap]
         _last_frame_time = [time.time()]
 
+        # Camera switch event — set by _switch_camera() to trigger reconnect
+        self._switch_event = threading.Event()
+
         def _reader():
             while _reader_alive[0]:
+                # Check if camera switch was requested
+                if self._switch_event.is_set():
+                    self._switch_event.clear()
+                    print("[Reader] Camera switch — reconnecting to new stream...")
+                    try:
+                        c = _cap_holder[0]
+                        if c is not None:
+                            c.release()
+                    except Exception:
+                        pass
+                    # Drain frame queue
+                    while not _frame_q.empty():
+                        try:
+                            _frame_q.get_nowait()
+                        except _queue.Empty:
+                            break
+                    _cap_holder[0] = None
+
                 c = _cap_holder[0]
                 if c is None or not c.isOpened():
                     print("[Reader] Reconnecting...")
@@ -1262,7 +1328,11 @@ class StreamServer:
 
                     elif msg_type == "start_round":
                         self._start_round(data)
-                        await ws.send(json.dumps({"type": "round_started", "roundId": self._round_id}))
+                        await ws.send(json.dumps({
+                            "type": "round_started",
+                            "roundId": self._round_id,
+                            "cameraId": self.camera_id,
+                        }))
 
                     elif msg_type == "stop_round":
                         result = self._stop_round()
@@ -1349,7 +1419,7 @@ def main():
     group.add_argument('--stream', '-s', help='Direct stream URL (HLS, RTSP, YouTube)')
     group.add_argument('--camera', help='Camera ID from cameras.json')
     parser.add_argument('--port', '-p', type=int, default=8765, help='WebSocket port')
-    parser.add_argument('--model', '-m', default='yolo12x.pt',
+    parser.add_argument('--model', '-m', default=os.environ.get('YOLO_MODEL', 'yolo12s.pt'),
                        help='YOLO model (yolo12n=fast, yolo12s=balanced, yolo12x=best)')
     parser.add_argument('--confidence', '-c', type=float, default=0.15, help='Detection confidence')
     parser.add_argument('--line', '-l', type=float, default=0.5, help='Counting line position (0-1)')
@@ -1360,7 +1430,7 @@ def main():
                        help='Line 2 (optional) as "x1,y1,x2,y2" fractions')
     parser.add_argument('--mode', choices=['line', 'uid'], default='uid',
                        help='Counting mode: line=crossing, uid=unique IDs (default: uid)')
-    parser.add_argument('--fps', type=int, default=8, help='Target output FPS')
+    parser.add_argument('--fps', type=int, default=int(os.environ.get('TARGET_FPS', '15')), help='Target output FPS')
 
     args = parser.parse_args()
 
