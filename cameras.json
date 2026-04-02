@@ -9,7 +9,8 @@
       "type": "youtube",
       "resolution": "1280x720",
       "linePoints": "0.266,0.502,0.763,0.499",
-      "notes": "Canadian inspection plaza, horizontal line across all lanes at ~50% Y"
+      "linePoints2": "0.266,0.544,0.763,0.541",
+      "notes": "Canadian inspection plaza, dual parallel lines at ~50% and ~54% Y"
     }
   ]
 }
