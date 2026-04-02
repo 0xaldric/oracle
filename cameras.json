@@ -182,17 +182,6 @@
       "notes": "2 counting lines calibrated from screenshot"
     },
     {
-      "id": "traffic-cam-3",
-      "name": "Live Traffic Camera 3",
-      "region": "Unknown",
-      "source": "YouTube Live",
-      "streamUrl": "https://www.youtube.com/watch?v=Zhmmh7l6KEw",
-      "type": "youtube",
-      "resolution": "1920x1080",
-      "linePoints": "0.180,0.673,0.053,0.864",
-      "notes": "Calibrated from screenshot"
-    },
-    {
       "id": "traffic-cam-4",
       "name": "Live Traffic Camera 4",
       "region": "Unknown",
