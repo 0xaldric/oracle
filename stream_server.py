@@ -923,9 +923,9 @@ class CloudflareBroadcaster:
                 '-rc', 'cbr',               # constant bitrate
                 '-pix_fmt', 'yuv420p',
                 '-g', str(self.fps * 2),
-                '-b:v', '600k',
-                '-maxrate', '700k',
-                '-bufsize', '400k',         # smaller buffer = lower latency
+                '-b:v', '500k',
+                '-maxrate', '600k',
+                '-bufsize', '300k',         # smaller buffer = lower latency
                 '-f', 'flv',
                 rtmps_dest,
             ]
@@ -945,9 +945,9 @@ class CloudflareBroadcaster:
                 '-tune', 'zerolatency',
                 '-pix_fmt', 'yuv420p',
                 '-g', str(self.fps * 2),
-                '-b:v', '600k',
-                '-maxrate', '700k',
-                '-bufsize', '400k',
+                '-b:v', '500k',
+                '-maxrate', '600k',
+                '-bufsize', '300k',
                 '-f', 'flv',
                 rtmps_dest,
             ]
@@ -963,36 +963,25 @@ class CloudflareBroadcaster:
             self._error_count = 0
             print(f"[CF] ffmpeg started (pid={self._proc.pid})")
 
-            # Start async writer thread — pushes frames at target fps
-            # Repeats the latest frame to maintain smooth CF stream even if
-            # YOLO processing is slower than target fps.
+            # Start async writer thread — reads frames from queue and writes to ffmpeg stdin
+            # Reader thread feeds raw frames at source fps (30fps) for smooth CF stream
             self._write_q = queue.Queue(maxsize=2)
             def _cf_writer():
                 proc = self._proc
                 wq = self._write_q
-                current_frame = None
-                interval = 1.0 / self.fps
                 while proc and proc.poll() is None and wq is not None:
-                    t0 = time.time()
-                    # Pick up latest frame if available
                     try:
-                        current_frame = wq.get_nowait()
+                        data = wq.get(timeout=1)
                     except queue.Empty:
-                        pass
-                    if current_frame is None:
-                        time.sleep(interval)
                         continue
                     try:
-                        proc.stdin.write(current_frame)
+                        proc.stdin.write(data)
                     except (BrokenPipeError, IOError) as e:
                         print(f"[CF Writer] pipe error: {e}")
                         break
                     except Exception as e:
                         print(f"[CF Writer] unexpected error: {e}")
                         break
-                    elapsed = time.time() - t0
-                    if elapsed < interval:
-                        time.sleep(interval - elapsed)
                 print("[CF Writer] thread exiting")
             self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
             self._writer_thread.start()
@@ -1605,6 +1594,21 @@ class StreamServer:
                     _last_frame_time[0] = time.time()
                     f = np.frombuffer(raw, dtype=np.uint8).reshape(
                         (frame_h[0], OUTPUT_WIDTH, 3)).copy()
+
+                    # Feed raw frame to CF at source fps (smooth 30fps)
+                    if self._cf.enabled and self._cf._write_q is not None:
+                        try:
+                            data = f.tobytes()
+                            # Drop old, keep latest
+                            while not self._cf._write_q.empty():
+                                try:
+                                    self._cf._write_q.get_nowait()
+                                except _queue.Empty:
+                                    break
+                            self._cf._write_q.put_nowait(data)
+                        except Exception:
+                            pass
+
                     # Replace whatever is in the queue with latest frame
                     while not _frame_q.empty():
                         try:
@@ -1728,8 +1732,8 @@ class StreamServer:
                 cv2.putText(display, dbg, (w_d - 420, h_d - 8),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 136), 1)
 
-                # Pipe frame to Cloudflare Stream
-                self._cf.send_frame(display)
+                # CF is now fed directly from reader thread at source fps
+                # (smooth 30fps without YOLO bottleneck)
 
                 # WS: JSON-only state updates at 1Hz
                 now = time.time()
