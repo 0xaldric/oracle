@@ -998,8 +998,8 @@ class CloudflareBroadcaster:
                 new_count = 0
                 hold_count = 0
                 # pop_rate: fraction of frames popped per write.
-                # 12fps input / 45fps output = 0.267 (pop 1 every ~3.75 writes)
-                pop_rate = 12.0 / cfps
+                # 30fps input / 45fps output = 0.667 (pop 1 every ~1.5 writes)
+                pop_rate = 30.0 / cfps
                 pop_accum = 0.0
                 next_time = time.monotonic()
                 last_log = time.monotonic()
@@ -1665,7 +1665,23 @@ class StreamServer:
                     f = np.frombuffer(raw, dtype=np.uint8).reshape(
                         (frame_h[0], OUTPUT_WIDTH, 3)).copy()
 
-                    # Replace whatever is in the queue with latest frame
+                    # Push frame to CF queue directly (30fps, bypasses main loop).
+                    # Overlay latest YOLO result if available.
+                    if self._cf.enabled and self._cf._proc is not None:
+                        cf_frame = f
+                        with _yolo_lock:
+                            yr = _yolo_result[0]
+                        if yr is not None and yr.shape == f.shape:
+                            if self._roi_mask is not None:
+                                roi_inv = cv2.bitwise_not(self._roi_mask)
+                                bg = cv2.bitwise_and(f, roi_inv)
+                                fg = cv2.bitwise_and(yr, self._roi_mask)
+                                cf_frame = cv2.add(bg, fg)
+                            else:
+                                cf_frame = yr
+                        self._cf.send_frame(cf_frame)
+
+                    # Replace whatever is in the main loop queue with latest frame
                     while not _frame_q.empty():
                         try:
                             _frame_q.get_nowait()
@@ -1797,8 +1813,7 @@ class StreamServer:
                 cv2.putText(display, dbg, (w_d - 420, h_d - 8),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 136), 1)
 
-                # Send YOLO-annotated frame to CF
-                self._cf.send_frame(display)
+                # CF is now fed directly from reader thread at 30fps
                 _t_cf = time.monotonic()
 
                 # Debug timing every 5s
