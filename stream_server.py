@@ -974,16 +974,15 @@ class CloudflareBroadcaster:
             except Exception as e:
                 print(f"[CF] pipe buffer resize failed (ok): {e}")
 
-            # Writer thread: pops YOLO frames from queue, repeats each at 30fps.
-            # YOLO pushes ~3fps → each frame repeated ~10x to fill 30fps.
-            # Queue buffers ~30s of YOLO frames, so stdin.write blocking
-            # (even 2s) never causes stutter — plenty of frames waiting.
+            # Writer thread: pops YOLO frames from queue, repeats each to fill 30fps.
+            # NO sleep — pipe backpressure naturally throttles to ffmpeg's pace.
+            # When pipe is full, write() blocks until ffmpeg consumes → perfect sync.
+            # Queue buffers ~30s of YOLO frames for resilience.
             self._alive = True
             repeat_count = max(1, self.fps // 3)  # ~10 repeats per YOLO frame
             def _cf_writer():
                 proc = self._proc
                 fq = self._frame_q
-                interval = 1.0 / self.fps
                 current = None
                 repeats_left = 0
                 frame_n = 0
@@ -995,22 +994,19 @@ class CloudflareBroadcaster:
                                 current = fq.get_nowait()
                                 repeats_left = repeat_count
                             except queue.Empty:
-                                # No new frame — keep repeating current
                                 if current is None:
-                                    time.sleep(interval)
+                                    time.sleep(0.03)
                                     continue
-                                repeats_left = 1  # repeat once more
-                        t0 = time.time()
+                                repeats_left = 1
                         try:
+                            # write() blocks when pipe full — this IS the throttle.
+                            # ffmpeg consumes at exactly 30fps encode rate.
                             proc.stdin.write(current)
                             frame_n += 1
                             repeats_left -= 1
                         except (BrokenPipeError, IOError) as e:
                             print(f"[CF Writer] pipe error: {e}")
                             break
-                        elapsed = time.time() - t0
-                        if elapsed < interval:
-                            time.sleep(interval - elapsed)
                 except Exception as e:
                     print(f"[CF Writer] FATAL: {e}")
                 print(f"[CF Writer] exiting (wrote {frame_n} frames, q={fq.qsize()})")
