@@ -1882,14 +1882,12 @@ class StreamServer:
                         self._save_evidence_frame(display, round_ts, round_elapsed, is_final=True)
 
                 # Adaptive FPS throttle — match source rate to keep buffer stable
-                # Source is ~30fps, so drain at 30fps (33.3ms/frame)
-                # If buffer is low, slow down slightly to let it refill
+                # Source is ~30fps. We consume 1 frame per loop at source rate,
+                # but broadcast the same JPEG to WS twice (above) for 60fps display.
                 source_interval = 1.0 / 30.0  # match YouTube 30fps source
                 if buf_remain < BUFFER_TARGET * 0.3:
-                    # Buffer getting low — slow down to let it refill
                     target_interval = source_interval * 1.05
                 elif buf_remain > BUFFER_TARGET * 1.2:
-                    # Buffer growing — speed up slightly
                     target_interval = source_interval * 0.95
                 else:
                     target_interval = source_interval
