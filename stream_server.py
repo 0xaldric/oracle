@@ -938,53 +938,31 @@ class CloudflareBroadcaster:
 
         cw, ch, cfps = self._cf_w, self._cf_h, self._cf_fps
         rtmps_dest = f"{self.rtmps_url}{self.stream_key}"
-        # Try NVENC (GPU encoding) first, fall back to libx264
         use_nvenc = self._check_nvenc()
+        # Input is MJPEG (cv2.imencode JPEGs piped in) — ~30-50KB/frame
+        # vs rawvideo 1.55MB/frame. Pipe never blocks.
+        encoder = 'h264_nvenc' if use_nvenc else 'libx264'
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'mjpeg',
+            '-r', str(cfps),
+            '-i', '-',
+            '-c:v', encoder,
+        ]
         if use_nvenc:
-            cmd = [
-                'ffmpeg',
-                '-y',
-                '-f', 'rawvideo',
-                '-vcodec', 'rawvideo',
-                '-pix_fmt', 'bgr24',
-                '-s', f'{cw}x{ch}',
-                '-r', str(cfps),
-                '-i', '-',
-                '-c:v', 'h264_nvenc',       # GPU encoding
-                '-preset', 'p1',            # fastest NVENC preset
-                '-tune', 'll',              # low latency
-                '-rc', 'cbr',               # constant bitrate
-                '-pix_fmt', 'yuv420p',
-                '-g', str(cfps * 2),
-                '-b:v', '500k',
-                '-maxrate', '600k',
-                '-bufsize', '300k',         # smaller buffer = lower latency
-                '-f', 'flv',
-                rtmps_dest,
-            ]
-            print(f"[CF] Using NVENC (GPU) encoding @ {cw}x{ch} {cfps}fps")
+            cmd += ['-preset', 'p1', '-tune', 'll', '-rc', 'cbr']
         else:
-            cmd = [
-                'ffmpeg',
-                '-y',
-                '-f', 'rawvideo',
-                '-vcodec', 'rawvideo',
-                '-pix_fmt', 'bgr24',
-                '-s', f'{cw}x{ch}',
-                '-r', str(cfps),
-                '-i', '-',
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-tune', 'zerolatency',
-                '-pix_fmt', 'yuv420p',
-                '-g', str(cfps * 2),
-                '-b:v', '500k',
-                '-maxrate', '600k',
-                '-bufsize', '300k',
-                '-f', 'flv',
-                rtmps_dest,
-            ]
-            print(f"[CF] Using libx264 (CPU) encoding @ {cw}x{ch} {cfps}fps")
+            cmd += ['-preset', 'ultrafast', '-tune', 'zerolatency']
+        cmd += [
+            '-pix_fmt', 'yuv420p',
+            '-g', str(cfps * 2),
+            '-b:v', '800k',
+            '-maxrate', '1000k',
+            '-bufsize', '500k',
+            '-f', 'flv',
+            rtmps_dest,
+        ]
+        print(f"[CF] {encoder} @ {cw}x{ch} {cfps}fps (MJPEG pipe)")
 
         try:
             self._proc = subprocess.Popen(
@@ -1078,7 +1056,9 @@ class CloudflareBroadcaster:
         if w != self._cf_w or h != self._cf_h:
             frame = cv2.resize(frame, (self._cf_w, self._cf_h),
                                interpolation=cv2.INTER_LINEAR)
-        self._latest_cf = frame.tobytes()
+        # Encode to JPEG (~30-50KB) instead of raw BGR (1.55MB)
+        _, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        self._latest_cf = jpg.tobytes()
         self._cf_event.set()
         self._frame_count += 1
 
