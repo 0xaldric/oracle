@@ -289,7 +289,7 @@ class VehicleCounter:
         results = self.model.track(
             frame, verbose=False, conf=self.confidence,
             classes=VEHICLE_CLASSES, persist=True,
-            tracker="botsort_custom.yaml", imgsz=960, device=0, half=True
+            tracker="bytetrack.yaml", imgsz=960, device=0, half=True
         )[0]
         _t_det_done = time.monotonic()
 
@@ -902,17 +902,12 @@ class CloudflareBroadcaster:
         self.width = width
         self.height = height
         self.fps = fps
-        # CF pipe uses smaller resolution for faster writes (1.55MB vs 2.7MB per frame)
+        # CF pipe — direct write, no queue (TensorRT + ByteTrack runs at 55fps)
         self._cf_w = 960
         self._cf_h = 540
-        self._cf_fps = 45
+        self._cf_fps = 30
         self._proc = None
         self._frame_count = 0
-        self._writer_thread = None
-        self._alive = False
-        # Queue: YOLO pushes ~10fps in order. Writer pops + repeats at 45fps.
-        # Small queue (300 = 30s buffer). Fixed repeat = 4 (~11fps consume).
-        self._frame_q = queue.Queue(maxsize=300)
 
         if self.enabled and not self.stream_key:
             print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
@@ -1005,72 +1000,6 @@ class CloudflareBroadcaster:
                 print(f"[CF] pipe buffer set to {pipe_sz} bytes")
             except Exception as e:
                 print(f"[CF] pipe buffer resize failed (ok): {e}")
-
-            # Queue writer: pop YOLO frame, repeat 4x at 45fps, pop next.
-            # Keeps frame order → smooth transitions. No adaptive rate.
-            # If queue empty: hold last frame. If queue > 250: skip to catch up.
-            self._alive = True
-            RPT = max(1, cfps // 10)  # 45//10 = 4 repeats per YOLO frame
-            def _cf_writer():
-                proc = self._proc
-                fq = self._frame_q
-                interval = 1.0 / cfps
-                current = None
-                repeats_left = 0
-                frame_n = 0
-                new_count = 0
-                next_time = time.monotonic()
-                last_log = time.monotonic()
-                try:
-                    while proc and proc.poll() is None and self._alive:
-                        if repeats_left <= 0:
-                            try:
-                                current = fq.get_nowait()
-                                new_count += 1
-                                repeats_left = RPT
-                                # If queue backed up, skip to catch up
-                                qs = fq.qsize()
-                                if qs > 250:
-                                    skip = qs - 200
-                                    for _ in range(skip):
-                                        try:
-                                            current = fq.get_nowait()
-                                        except queue.Empty:
-                                            break
-                                    repeats_left = RPT
-                            except queue.Empty:
-                                if current is None:
-                                    time.sleep(0.03)
-                                    next_time = time.monotonic()
-                                    continue
-                                repeats_left = 1  # hold last frame
-                        # Pace at 45fps
-                        now = time.monotonic()
-                        wait = next_time - now
-                        if wait > 0:
-                            time.sleep(wait)
-                        next_time += interval
-                        if time.monotonic() - next_time > 1.0:
-                            next_time = time.monotonic()
-                        try:
-                            proc.stdin.write(current)
-                            frame_n += 1
-                            repeats_left -= 1
-                        except (BrokenPipeError, IOError) as e:
-                            print(f"[CF Writer] pipe error: {e}")
-                            break
-                        # Debug every 10s
-                        now_m = time.monotonic()
-                        if now_m - last_log >= 10.0:
-                            last_log = now_m
-                            qs = fq.qsize()
-                            print(f"[CF Writer] frames={frame_n} new={new_count} q={qs} rpt={RPT}")
-                            new_count = 0
-                except Exception as e:
-                    print(f"[CF Writer] FATAL: {e}")
-                print(f"[CF Writer] exiting (wrote {frame_n} frames, q={fq.qsize()})")
-            self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
-            self._writer_thread.start()
         except FileNotFoundError:
             print("[CF] ERROR: ffmpeg not found! Install with: apt install ffmpeg")
             self.enabled = False
@@ -1079,21 +1008,16 @@ class CloudflareBroadcaster:
             self.enabled = False
 
     def send_frame(self, frame):
-        """Push a YOLO-annotated frame into the queue. Never blocks main loop.
+        """Write YOLO-annotated frame directly to ffmpeg pipe.
 
-        Writer thread pops frames and repeats each ~10x to fill 30fps.
-        Queue buffers ~30s so stdin blocking never causes stream stutter.
+        With TensorRT + ByteTrack running at 55fps, no queue needed —
+        each frame is written straight to the ffmpeg stdin pipe.
         """
         if not self.enabled or self._proc is None:
             return
-        # Auto-restart if ffmpeg or writer thread died
+        # Auto-restart if ffmpeg died
         if self._proc.poll() is not None:
             print(f"[CF] ffmpeg exited (code={self._proc.returncode}), restarting...")
-            self.start()
-            if not self.enabled or self._proc is None:
-                return
-        if self._writer_thread is not None and not self._writer_thread.is_alive():
-            print("[CF] writer thread died, restarting...")
             self.start()
             if not self.enabled or self._proc is None:
                 return
@@ -1102,11 +1026,10 @@ class CloudflareBroadcaster:
         if w != self._cf_w or h != self._cf_h:
             frame = cv2.resize(frame, (self._cf_w, self._cf_h),
                                interpolation=cv2.INTER_LINEAR)
-        data = frame.tobytes()
         try:
-            self._frame_q.put_nowait(data)
-        except queue.Full:
-            pass  # full — YOLO frame dropped, writer will catch up
+            self._proc.stdin.write(frame.tobytes())
+        except (BrokenPipeError, IOError) as e:
+            print(f"[CF] pipe error: {e}")
         self._frame_count += 1
 
     def stop(self):
@@ -1116,12 +1039,6 @@ class CloudflareBroadcaster:
             print(f"[CF] Stopped after {self._frame_count} frames")
 
     def _stop_proc(self):
-        self._alive = False
-        while not self._frame_q.empty():
-            try:
-                self._frame_q.get_nowait()
-            except queue.Empty:
-                break
         if self._proc is not None:
             try:
                 self._proc.stdin.close()
