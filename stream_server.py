@@ -903,10 +903,10 @@ class CloudflareBroadcaster:
         self.height = height
         self.fps = fps
         # CF pipe — YOLO sets latest frame, writer thread pushes to ffmpeg
-        # 640x360 = 691KB/frame (fits in 1MB pipe buffer)
-        self._cf_w = 640
-        self._cf_h = 360
-        self._cf_fps = 15
+        # 960x540 @ 30fps for smooth CF playback
+        self._cf_w = 960
+        self._cf_h = 540
+        self._cf_fps = 30
         self._proc = None
         self._frame_count = 0
         self._latest_cf = None
@@ -996,25 +996,27 @@ class CloudflareBroadcaster:
             self._frame_count = 0
             print(f"[CF] ffmpeg started (pid={self._proc.pid})")
 
+            # Set pipe buffer as large as possible (16MB = ~10 frames buffer)
             try:
                 import fcntl
                 F_SETPIPE_SZ = 1031
-                fcntl.fcntl(self._proc.stdin.fileno(), F_SETPIPE_SZ, 1048576 * 4)
+                # Try 16MB, kernel may cap it lower
+                desired = 1048576 * 16
+                actual = fcntl.fcntl(self._proc.stdin.fileno(), F_SETPIPE_SZ, desired)
+                print(f"[CF] pipe buffer: {actual // 1048576}MB")
             except Exception:
                 pass
 
             # Writer thread: paces at cf_fps, writes latest frame to pipe.
-            # Uses select() to check pipe is writable before writing,
-            # preventing indefinite blocking if ffmpeg falls behind.
-            import select
+            # If write takes too long (pipe full / ffmpeg stuck), kills
+            # ffmpeg and triggers auto-restart on next send_frame().
             def _cf_writer():
                 proc = self._proc
-                fd = proc.stdin.fileno()
                 n = 0
-                skipped = 0
                 interval = 1.0 / self._cf_fps
                 next_t = time.monotonic()
                 last_log = time.monotonic()
+                last_write = time.monotonic()
                 try:
                     while proc.poll() is None:
                         now = time.monotonic()
@@ -1027,22 +1029,24 @@ class CloudflareBroadcaster:
                         data = self._latest_cf
                         if data is None:
                             continue
-                        # Check if pipe is writable (timeout 50ms)
-                        _, wready, _ = select.select([], [fd], [], 0.05)
-                        if wready:
-                            proc.stdin.write(data)
-                            proc.stdin.flush()
-                            n += 1
-                        else:
-                            skipped += 1
+                        t0 = time.monotonic()
+                        proc.stdin.write(data)
+                        write_ms = (time.monotonic() - t0) * 1000
+                        n += 1
+                        last_write = time.monotonic()
+                        # If a single write takes >2s, ffmpeg is stuck
+                        if write_ms > 2000:
+                            print(f"[CF] write took {write_ms:.0f}ms — killing ffmpeg")
+                            proc.kill()
+                            break
                         if time.monotonic() - last_log >= 30.0:
                             last_log = time.monotonic()
-                            print(f"[CF] wrote={n} skipped={skipped}")
+                            print(f"[CF] {n} frames, last write {write_ms:.0f}ms")
                 except (BrokenPipeError, IOError) as e:
                     print(f"[CF] pipe error: {e}")
                 except Exception as e:
                     print(f"[CF] writer error: {e}")
-                print(f"[CF] writer done ({n} wrote, {skipped} skipped)")
+                print(f"[CF] writer done ({n} frames)")
             self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
             self._writer_thread.start()
         except FileNotFoundError:
