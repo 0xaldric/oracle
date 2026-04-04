@@ -580,10 +580,13 @@ def get_stream_url(youtube_url, force_refresh=False):
     if deno_path not in env.get("PATH", ""):
         env["PATH"] = f"{deno_path}:{env.get('PATH', '')}"
 
+    # Use cookies file if present (bypasses YouTube bot detection)
+    cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+    cookies_args = ['--cookies', cookies_file] if os.path.isfile(cookies_file) else []
+
     commands = [
-        ['yt-dlp', '--remote-components', 'ejs:github', '-f', 'best[height<=720]', '-g', youtube_url],
-        ['yt-dlp', '-f', 'best[height<=720]', '-g', youtube_url],
-        ['yt-dlp', '-f', 'best', '-g', youtube_url],
+        ['yt-dlp'] + cookies_args + ['-f', 'best[height<=720]', '-g', youtube_url],
+        ['yt-dlp'] + cookies_args + ['-f', 'best', '-g', youtube_url],
     ]
 
     for cmd in commands:
