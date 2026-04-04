@@ -1484,6 +1484,7 @@ class StreamServer:
 
         self.running = True
         frame_idx = 0
+        _last_ws_binary = 0.0  # time-based WS binary throttle
         frame_interval = 1.0 / self.target_fps
         server_start = time.time()
 
@@ -1816,11 +1817,9 @@ class StreamServer:
                     self._cf.send_frame(display)
                 _t_cf = time.monotonic()
 
-                # Broadcast binary JPEG frame to WS clients (Live Mode)
-                # Throttle to 10fps to avoid overwhelming browser WS buffer
-                # (30fps × 69KB = 2MB/s causes browser WS disconnect)
-                if self.clients and frame_idx % 3 == 0:
-                    _, jpeg_ws = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 55])
+                # Broadcast binary JPEG frame to WS clients — every frame for max smoothness
+                if self.clients:
+                    _, jpeg_ws = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 70])
                     jpeg_data = jpeg_ws.tobytes()
                     async def _send_binary(data):
                         dead = set()
