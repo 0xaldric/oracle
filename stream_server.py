@@ -1002,16 +1002,23 @@ class CloudflareBroadcaster:
             except Exception:
                 pass
 
-            # Writer thread: waits for new frame signal, writes to pipe.
-            # Pipe is blocking (ensures complete frames), but runs in its
-            # own thread so YOLO main loop is never blocked.
+            # Writer thread: paces at exactly 30fps, grabs latest frame.
+            # YOLO sets _latest_cf whenever ready (never blocks).
+            # Writer sleeps to maintain 30fps cadence, then writes.
             def _cf_writer():
                 proc = self._proc
                 n = 0
+                interval = 1.0 / self._cf_fps  # ~33ms
+                next_t = time.monotonic()
                 try:
                     while proc.poll() is None:
-                        self._cf_event.wait(timeout=0.1)
-                        self._cf_event.clear()
+                        now = time.monotonic()
+                        sleep_t = next_t - now
+                        if sleep_t > 0:
+                            time.sleep(sleep_t)
+                        next_t += interval
+                        if time.monotonic() - next_t > 1.0:
+                            next_t = time.monotonic()
                         data = self._latest_cf
                         if data is None:
                             continue
