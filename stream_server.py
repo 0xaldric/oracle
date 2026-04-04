@@ -902,12 +902,15 @@ class CloudflareBroadcaster:
         self.width = width
         self.height = height
         self.fps = fps
-        # CF pipe — direct write from YOLO, non-blocking
+        # CF pipe — YOLO sets latest frame, writer thread pushes to ffmpeg
         self._cf_w = 960
         self._cf_h = 540
         self._cf_fps = 30
         self._proc = None
         self._frame_count = 0
+        self._latest_cf = None
+        self._cf_event = threading.Event()
+        self._writer_thread = None
 
         if self.enabled and not self.stream_key:
             print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
@@ -992,18 +995,35 @@ class CloudflareBroadcaster:
             self._frame_count = 0
             print(f"[CF] ffmpeg started (pid={self._proc.pid})")
 
-            # Set pipe to non-blocking so write never freezes main loop
-            import fcntl, os as _os
-            F_SETPIPE_SZ = 1031
-            fd = self._proc.stdin.fileno()
             try:
-                pipe_sz = fcntl.fcntl(fd, F_SETPIPE_SZ, 1048576)
-                print(f"[CF] pipe buffer set to {pipe_sz} bytes")
+                import fcntl
+                F_SETPIPE_SZ = 1031
+                fcntl.fcntl(self._proc.stdin.fileno(), F_SETPIPE_SZ, 1048576 * 4)
             except Exception:
                 pass
-            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, flags | _os.O_NONBLOCK)
-            print(f"[CF] pipe set to non-blocking")
+
+            # Writer thread: waits for new frame signal, writes to pipe.
+            # Pipe is blocking (ensures complete frames), but runs in its
+            # own thread so YOLO main loop is never blocked.
+            def _cf_writer():
+                proc = self._proc
+                n = 0
+                try:
+                    while proc.poll() is None:
+                        self._cf_event.wait(timeout=0.1)
+                        self._cf_event.clear()
+                        data = self._latest_cf
+                        if data is None:
+                            continue
+                        proc.stdin.write(data)
+                        n += 1
+                except (BrokenPipeError, IOError) as e:
+                    print(f"[CF] pipe error: {e}")
+                except Exception as e:
+                    print(f"[CF] writer error: {e}")
+                print(f"[CF] writer done ({n} frames)")
+            self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
+            self._writer_thread.start()
         except FileNotFoundError:
             print("[CF] ERROR: ffmpeg not found! Install with: apt install ffmpeg")
             self.enabled = False
@@ -1012,9 +1032,9 @@ class CloudflareBroadcaster:
             self.enabled = False
 
     def send_frame(self, frame):
-        """Write YOLO frame directly to ffmpeg pipe (non-blocking).
+        """Set latest frame and signal writer thread. Never blocks YOLO.
 
-        Pipe is O_NONBLOCK — if ffmpeg is busy, frame is silently dropped.
+        Writer thread does the actual blocking pipe write in background.
         """
         if not self.enabled or self._proc is None:
             return
@@ -1023,19 +1043,19 @@ class CloudflareBroadcaster:
             self.start()
             if not self.enabled or self._proc is None:
                 return
+        if self._writer_thread is not None and not self._writer_thread.is_alive():
+            print("[CF] writer died, restarting...")
+            self.start()
+            if not self.enabled or self._proc is None:
+                return
 
         h, w = frame.shape[:2]
         if w != self._cf_w or h != self._cf_h:
             frame = cv2.resize(frame, (self._cf_w, self._cf_h),
                                interpolation=cv2.INTER_LINEAR)
-        try:
-            self._proc.stdin.write(frame.tobytes())
-            self._proc.stdin.flush()
-            self._frame_count += 1
-        except BlockingIOError:
-            pass  # pipe full, skip frame
-        except (BrokenPipeError, IOError) as e:
-            print(f"[CF] pipe error: {e}")
+        self._latest_cf = frame.tobytes()
+        self._cf_event.set()
+        self._frame_count += 1
 
     def stop(self):
         """Stop ffmpeg subprocess."""
