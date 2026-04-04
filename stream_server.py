@@ -903,10 +903,9 @@ class CloudflareBroadcaster:
         self.height = height
         self.fps = fps
         # CF pipe — YOLO sets latest frame, writer thread pushes to ffmpeg
-        # 960x540 @ 30fps for smooth CF playback
         self._cf_w = 960
         self._cf_h = 540
-        self._cf_fps = 30
+        self._cf_fps = 40
         self._proc = None
         self._frame_count = 0
         self._latest_cf = None
@@ -956,9 +955,9 @@ class CloudflareBroadcaster:
         cmd += [
             '-pix_fmt', 'yuv420p',
             '-g', str(cfps * 2),
-            '-b:v', '800k',
-            '-maxrate', '1000k',
-            '-bufsize', '500k',
+            '-b:v', '1500k',
+            '-maxrate', '2000k',
+            '-bufsize', '1000k',
             '-f', 'flv',
             rtmps_dest,
         ]
