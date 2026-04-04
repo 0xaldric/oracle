@@ -903,9 +903,10 @@ class CloudflareBroadcaster:
         self.height = height
         self.fps = fps
         # CF pipe — YOLO sets latest frame, writer thread pushes to ffmpeg
-        self._cf_w = 960
-        self._cf_h = 540
-        self._cf_fps = 30
+        # 640x360 = 691KB/frame (fits in 1MB pipe buffer)
+        self._cf_w = 640
+        self._cf_h = 360
+        self._cf_fps = 15
         self._proc = None
         self._frame_count = 0
         self._latest_cf = None
@@ -1002,14 +1003,18 @@ class CloudflareBroadcaster:
             except Exception:
                 pass
 
-            # Writer thread: paces at exactly 30fps, grabs latest frame.
-            # YOLO sets _latest_cf whenever ready (never blocks).
-            # Writer sleeps to maintain 30fps cadence, then writes.
+            # Writer thread: paces at cf_fps, writes latest frame to pipe.
+            # Uses select() to check pipe is writable before writing,
+            # preventing indefinite blocking if ffmpeg falls behind.
+            import select
             def _cf_writer():
                 proc = self._proc
+                fd = proc.stdin.fileno()
                 n = 0
-                interval = 1.0 / self._cf_fps  # ~33ms
+                skipped = 0
+                interval = 1.0 / self._cf_fps
                 next_t = time.monotonic()
+                last_log = time.monotonic()
                 try:
                     while proc.poll() is None:
                         now = time.monotonic()
@@ -1022,13 +1027,22 @@ class CloudflareBroadcaster:
                         data = self._latest_cf
                         if data is None:
                             continue
-                        proc.stdin.write(data)
-                        n += 1
+                        # Check if pipe is writable (timeout 50ms)
+                        _, wready, _ = select.select([], [fd], [], 0.05)
+                        if wready:
+                            proc.stdin.write(data)
+                            proc.stdin.flush()
+                            n += 1
+                        else:
+                            skipped += 1
+                        if time.monotonic() - last_log >= 30.0:
+                            last_log = time.monotonic()
+                            print(f"[CF] wrote={n} skipped={skipped}")
                 except (BrokenPipeError, IOError) as e:
                     print(f"[CF] pipe error: {e}")
                 except Exception as e:
                     print(f"[CF] writer error: {e}")
-                print(f"[CF] writer done ({n} frames)")
+                print(f"[CF] writer done ({n} wrote, {skipped} skipped)")
             self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
             self._writer_thread.start()
         except FileNotFoundError:
