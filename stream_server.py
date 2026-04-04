@@ -1660,8 +1660,7 @@ class StreamServer:
                     _yolo_result[0] = annotated
                     _yolo_result[1] = cnt
 
-                # Push YOLO-annotated frame to CF queue.
-                # Composite with ROI if needed, then send.
+                # Push YOLO-annotated frame to CF queue (only when CF is active).
                 if self._cf.enabled and self._cf._proc is not None:
                     cf_frame = annotated
                     if annotated.shape == yf.shape and self._roi_mask is not None:
@@ -1765,19 +1764,26 @@ class StreamServer:
                 cv2.putText(display, dbg, (w_d - 420, h_d - 8),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 136), 1)
 
-                # Send annotated frame to CF broadcast
-                self._cf.send_frame(display)
+                # Send annotated frame to CF broadcast (if enabled)
+                if self._cf.enabled:
+                    self._cf.send_frame(display)
                 _t_cf = time.monotonic()
 
                 # Broadcast binary JPEG frame to WS clients (Live Mode)
-                if self.clients and frame_idx % max(1, int(fps_actual / self.target_fps)) == 0:
-                    _, jpeg_ws = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                # Every frame, no throttling — max smoothness
+                if self.clients:
+                    _, jpeg_ws = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 65])
                     jpeg_data = jpeg_ws.tobytes()
                     async def _send_binary(data):
                         dead = set()
+                        sends = []
                         for ws in list(self.clients):
+                            sends.append((ws, asyncio.ensure_future(
+                                asyncio.wait_for(ws.send(data), timeout=0.2)
+                            )))
+                        for ws, fut in sends:
                             try:
-                                await asyncio.wait_for(ws.send(data), timeout=0.5)
+                                await fut
                             except Exception:
                                 dead.add(ws)
                         if dead:
@@ -1984,7 +1990,7 @@ def main():
                        help='Line 2 (optional) as "x1,y1,x2,y2" fractions')
     parser.add_argument('--mode', choices=['line', 'uid'], default='uid',
                        help='Counting mode: line=crossing, uid=unique IDs (default: uid)')
-    parser.add_argument('--fps', type=int, default=int(os.environ.get('TARGET_FPS', '15')), help='Target output FPS')
+    parser.add_argument('--fps', type=int, default=int(os.environ.get('TARGET_FPS', '40')), help='Target output FPS')
 
     args = parser.parse_args()
 
