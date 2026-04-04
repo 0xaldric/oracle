@@ -576,9 +576,11 @@ def get_stream_url(youtube_url, force_refresh=False):
         print(f"[yt-dlp] Force refresh for camera switch")
 
     deno_path = os.path.expanduser("~/.deno/bin")
+    venv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'venv', 'bin')
     env = os.environ.copy()
-    if deno_path not in env.get("PATH", ""):
-        env["PATH"] = f"{deno_path}:{env.get('PATH', '')}"
+    extra_paths = [p for p in [venv_path, deno_path] if p not in env.get("PATH", "")]
+    if extra_paths:
+        env["PATH"] = ":".join(extra_paths) + ":" + env.get("PATH", "")
 
     # Use cookies file if present (bypasses YouTube bot detection)
     cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
@@ -591,6 +593,7 @@ def get_stream_url(youtube_url, force_refresh=False):
 
     for cmd in commands:
         try:
+            print(f"[yt-dlp] Running: {' '.join(cmd[:4])}...")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=env)
             if result.returncode == 0:
                 url = result.stdout.strip()
@@ -598,9 +601,13 @@ def get_stream_url(youtube_url, force_refresh=False):
                 cache[youtube_url] = [url, time.time()]
                 _save_url_cache(cache)
                 return url
+            else:
+                print(f"[yt-dlp] Failed (code={result.returncode}): {result.stderr.strip()[-200:]}")
         except FileNotFoundError:
+            print(f"[yt-dlp] ERROR: yt-dlp not found in PATH")
             return youtube_url
         except subprocess.TimeoutExpired:
+            print(f"[yt-dlp] Timeout after 60s")
             continue
 
     # yt-dlp failed — return cached even if stale, better than nothing
