@@ -902,12 +902,15 @@ class CloudflareBroadcaster:
         self.width = width
         self.height = height
         self.fps = fps
-        # CF pipe — direct write, no queue (TensorRT + ByteTrack runs at 55fps)
+        # CF pipe — writer thread takes latest frame, never blocks main loop
         self._cf_w = 960
         self._cf_h = 540
         self._cf_fps = 30
         self._proc = None
         self._frame_count = 0
+        self._latest_cf = None          # latest frame bytes (overwritten each call)
+        self._cf_lock = threading.Lock()
+        self._writer_thread = None
 
         if self.enabled and not self.stream_key:
             print("[CF] WARNING: CF_STREAM_ENABLED=true but CF_STREAM_KEY is empty — disabling")
@@ -1000,6 +1003,44 @@ class CloudflareBroadcaster:
                 print(f"[CF] pipe buffer set to {pipe_sz} bytes")
             except Exception as e:
                 print(f"[CF] pipe buffer resize failed (ok): {e}")
+
+            # Writer thread: writes latest frame at 30fps. Never blocks main loop.
+            # If YOLO is faster than 30fps, intermediate frames are skipped.
+            # If YOLO is slower, the last frame is repeated to maintain 30fps.
+            def _cf_writer():
+                proc = self._proc
+                interval = 1.0 / self._cf_fps
+                frame_n = 0
+                next_time = time.monotonic()
+                last_log = time.monotonic()
+                try:
+                    while proc and proc.poll() is None:
+                        now = time.monotonic()
+                        wait = next_time - now
+                        if wait > 0:
+                            time.sleep(wait)
+                        next_time += interval
+                        # Drift correction
+                        if time.monotonic() - next_time > 1.0:
+                            next_time = time.monotonic()
+                        with self._cf_lock:
+                            data = self._latest_cf
+                        if data is None:
+                            continue
+                        try:
+                            proc.stdin.write(data)
+                            frame_n += 1
+                        except (BrokenPipeError, IOError) as e:
+                            print(f"[CF] pipe error: {e}")
+                            break
+                        if time.monotonic() - last_log >= 30.0:
+                            last_log = time.monotonic()
+                            print(f"[CF] wrote {frame_n} frames")
+                except Exception as e:
+                    print(f"[CF] writer error: {e}")
+                print(f"[CF] writer exiting ({frame_n} frames)")
+            self._writer_thread = threading.Thread(target=_cf_writer, daemon=True, name="cf-writer")
+            self._writer_thread.start()
         except FileNotFoundError:
             print("[CF] ERROR: ffmpeg not found! Install with: apt install ffmpeg")
             self.enabled = False
@@ -1008,10 +1049,10 @@ class CloudflareBroadcaster:
             self.enabled = False
 
     def send_frame(self, frame):
-        """Write YOLO-annotated frame directly to ffmpeg pipe.
+        """Set latest YOLO frame for CF writer thread. Never blocks.
 
-        With TensorRT + ByteTrack running at 55fps, no queue needed —
-        each frame is written straight to the ffmpeg stdin pipe.
+        Writer thread reads this at 30fps and writes to ffmpeg pipe.
+        If YOLO produces frames faster, intermediate ones are skipped.
         """
         if not self.enabled or self._proc is None:
             return
@@ -1021,15 +1062,18 @@ class CloudflareBroadcaster:
             self.start()
             if not self.enabled or self._proc is None:
                 return
+        if self._writer_thread is not None and not self._writer_thread.is_alive():
+            print("[CF] writer thread died, restarting...")
+            self.start()
+            if not self.enabled or self._proc is None:
+                return
 
         h, w = frame.shape[:2]
         if w != self._cf_w or h != self._cf_h:
             frame = cv2.resize(frame, (self._cf_w, self._cf_h),
                                interpolation=cv2.INTER_LINEAR)
-        try:
-            self._proc.stdin.write(frame.tobytes())
-        except (BrokenPipeError, IOError) as e:
-            print(f"[CF] pipe error: {e}")
+        with self._cf_lock:
+            self._latest_cf = frame.tobytes()
         self._frame_count += 1
 
     def stop(self):
