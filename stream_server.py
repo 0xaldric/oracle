@@ -1766,14 +1766,30 @@ class StreamServer:
                 cv2.putText(display, dbg, (w_d - 420, h_d - 8),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 136), 1)
 
-                # CF is now fed directly from reader thread at 30fps
+                # Send annotated frame to CF broadcast
+                self._cf.send_frame(display)
                 _t_cf = time.monotonic()
+
+                # Broadcast binary JPEG frame to WS clients (Live Mode)
+                if self.clients and frame_idx % max(1, int(fps_actual / self.target_fps)) == 0:
+                    _, jpeg_ws = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    jpeg_data = jpeg_ws.tobytes()
+                    async def _send_binary(data):
+                        dead = set()
+                        for ws in list(self.clients):
+                            try:
+                                await asyncio.wait_for(ws.send(data), timeout=0.5)
+                            except Exception:
+                                dead.add(ws)
+                        if dead:
+                            self.clients -= dead
+                    asyncio.run_coroutine_threadsafe(_send_binary(jpeg_data), loop)
 
                 # Debug timing every 5s
                 if frame_idx % 150 == 0:
                     print(f"[MainLoop] get={(_t_get-_t0)*1000:.0f}ms proc={(_t_proc-_t_get)*1000:.0f}ms cf={(_t_cf-_t_proc)*1000:.0f}ms total={(_t_cf-_t0)*1000:.0f}ms")
 
-                # WS: JSON-only state updates at 1Hz
+                # WS: JSON state updates at 1Hz
                 now = time.time()
                 if now - last_ws_time >= 1.0:
                     last_ws_time = now
