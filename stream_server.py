@@ -29,6 +29,9 @@ import threading
 import faulthandler
 faulthandler.enable()
 
+# Force unbuffered stdout for real-time logging
+sys.stdout.reconfigure(line_buffering=True)
+
 # Load .env file if present (no dependency needed)
 _env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 if os.path.isfile(_env_file):
@@ -1484,13 +1487,23 @@ class StreamServer:
         frame_interval = 1.0 / self.target_fps
         server_start = time.time()
 
-        # Reader thread
+        # Reader thread with large JPEG buffer for smooth playback
         import threading
-        _frame_q = _queue.Queue(maxsize=2)
+        import collections
+        # Buffer: store JPEG-compressed frames to save memory
+        # 2 min @ 30fps = 3600 frames × ~50KB = ~180MB — very manageable
+        BUFFER_DELAY_SECS = int(os.environ.get('BUFFER_DELAY', '120'))
+        BUFFER_TARGET = int(30 * BUFFER_DELAY_SECS)  # frames to buffer before playback
+        BUFFER_MAX = BUFFER_TARGET + 300  # headroom
+        _frame_buf = collections.deque(maxlen=BUFFER_MAX)
+        _buf_lock = threading.Lock()
+        _buf_ready = threading.Event()  # set when buffer has enough frames
+        _frame_q = _queue.Queue(maxsize=2)  # legacy, unused now
         _reader_alive = [True]
         _cap_holder = [cap]         # cv2.VideoCapture (HLS direct) or None
         _last_frame_time = [time.time()]
         self._switch_event = threading.Event()
+        _buf_fill_logged = [False]
 
         _force_refresh = [False]  # Force yt-dlp refresh after camera switch
         _ff_proc_holder = [None]  # ffmpeg decoder subprocess
@@ -1619,18 +1632,21 @@ class StreamServer:
                     f = np.frombuffer(raw, dtype=np.uint8).reshape(
                         (frame_h[0], OUTPUT_WIDTH, 3)).copy()
 
-                    # CF is now fed from YOLO worker (not reader)
+                    # Store JPEG-compressed frame in buffer (saves ~30x memory)
+                    _, jpg = cv2.imencode('.jpg', f, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    with _buf_lock:
+                        _frame_buf.append(jpg.tobytes())
+                        buf_len = len(_frame_buf)
 
-                    # Replace whatever is in the main loop queue with latest frame
-                    while not _frame_q.empty():
-                        try:
-                            _frame_q.get_nowait()
-                        except _queue.Empty:
-                            break
-                    try:
-                        _frame_q.put(f, timeout=0.1)
-                    except _queue.Full:
-                        pass
+                    # Log buffer fill progress
+                    if not _buf_fill_logged[0]:
+                        if buf_len % 300 == 0 or buf_len >= BUFFER_TARGET:
+                            pct = min(100, int(buf_len / BUFFER_TARGET * 100))
+                            print(f"[Buffer] Filling: {buf_len}/{BUFFER_TARGET} frames ({pct}%)")
+                        if buf_len >= BUFFER_TARGET:
+                            _buf_fill_logged[0] = True
+                            _buf_ready.set()
+                            print(f"[Buffer] Ready! {BUFFER_DELAY_SECS}s buffer filled — starting smooth playback")
 
                 except Exception as e:
                     print(f"[Reader] Read error: {e}")
@@ -1684,6 +1700,10 @@ class StreamServer:
             asyncio.run_coroutine_threadsafe(self._broadcast_json(msg_dict), loop)
 
         last_ws_time = 0
+        _playback_clock = [None]  # monotonic time of first frame consumed
+
+        # Wait for buffer to fill before starting playback
+        print(f"[Buffer] Buffering {BUFFER_DELAY_SECS}s of video for smooth playback...")
 
         try:
             while self.running:
@@ -1708,12 +1728,39 @@ class StreamServer:
                                 **result,
                             })
 
-                # ── Get frame ────────────────────────────────────────
+                # ── Get frame from buffer (smooth, clock-driven) ─────
                 _t0 = time.monotonic()
-                try:
-                    frame = _frame_q.get(timeout=0.1)
-                except _queue.Empty:
-                    continue
+
+                # Wait until buffer is ready (first time only)
+                if not _buf_ready.is_set():
+                    # Still send WS status while buffering
+                    if self.clients:
+                        with _buf_lock:
+                            buf_len = len(_frame_buf)
+                        pct = min(100, int(buf_len / BUFFER_TARGET * 100))
+                        _safe_broadcast({
+                            "type": "buffering",
+                            "progress": pct,
+                            "buffered": buf_len,
+                            "target": BUFFER_TARGET,
+                            "cameraId": self.camera_id,
+                        })
+                    _buf_ready.wait(timeout=1.0)
+                    if not _buf_ready.is_set():
+                        continue
+
+                # Pop oldest frame from buffer
+                with _buf_lock:
+                    if not _frame_buf:
+                        time.sleep(0.005)
+                        continue
+                    jpg_bytes = _frame_buf.popleft()
+                    buf_remain = len(_frame_buf)
+
+                # Decode JPEG back to BGR
+                frame = cv2.imdecode(
+                    np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
+                )
                 _t_get = time.monotonic()
 
                 frame_idx += 1
@@ -1792,7 +1839,7 @@ class StreamServer:
 
                 # Debug timing every 5s
                 if frame_idx % 150 == 0:
-                    print(f"[MainLoop] get={(_t_get-_t0)*1000:.0f}ms proc={(_t_proc-_t_get)*1000:.0f}ms cf={(_t_cf-_t_proc)*1000:.0f}ms total={(_t_cf-_t0)*1000:.0f}ms")
+                    print(f"[MainLoop] get={(_t_get-_t0)*1000:.0f}ms proc={(_t_proc-_t_get)*1000:.0f}ms cf={(_t_cf-_t_proc)*1000:.0f}ms total={(_t_cf-_t0)*1000:.0f}ms buf={buf_remain}")
 
                 # WS: JSON state updates at 1Hz
                 now = time.time()
@@ -1916,6 +1963,7 @@ class StreamServer:
         print(f"  Model: {self.counter.model.model_name}")
         print(f"  Mode: persistent (rounds via WS control)")
         print(f"  Target FPS: {self.target_fps}")
+        print(f"  Buffer Delay: 120s (~3600 frames) for smooth playback")
         if self._cf.enabled:
             print(f"  CF Broadcast: ON (videoUid={self._cf.video_uid})")
         else:
