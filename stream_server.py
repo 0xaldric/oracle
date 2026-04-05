@@ -55,21 +55,21 @@ except ImportError as e:
 
 # Fast JPEG encoding — turbojpeg is 3-5x faster than cv2.imencode
 try:
-    from turbojpeg import TurboJPEG, TJFLAG_FASTDCT
+    from turbojpeg import TurboJPEG
     _tjpeg = TurboJPEG()
     def _fast_jpeg_encode(frame, quality=55):
-        return _tjpeg.encode(frame, quality=quality, flags=TJFLAG_FASTDCT)
+        return _tjpeg.encode(frame, quality=quality)
     def _fast_jpeg_decode(buf):
         return _tjpeg.decode(buf)
     print("[Init] Using TurboJPEG for fast encode/decode")
-except ImportError:
+except (ImportError, RuntimeError) as e:
     _tjpeg = None
     def _fast_jpeg_encode(frame, quality=55):
         _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
         return buf.tobytes()
     def _fast_jpeg_decode(buf):
         return cv2.imdecode(np.frombuffer(buf, dtype=np.uint8), cv2.IMREAD_COLOR)
-    print("[Init] TurboJPEG not found, using cv2 (pip install PyTurboJPEG for 3-5x faster)")
+    print(f"[Init] TurboJPEG not available ({e}), using cv2 fallback")
 
 
 # Vehicle classes in COCO dataset
