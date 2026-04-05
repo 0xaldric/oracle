@@ -1,16 +1,17 @@
 {
   "cameras": [
     {
-      "id": "peace-bridge-plaza",
-      "name": "Peace Bridge — CND Inspection Plaza",
-      "region": "Fort Erie, ON, Canada",
+      "id": "peace-bridge",
+      "name": "Peace Bridge — USA/Canada Border",
+      "region": "Buffalo, NY / Fort Erie, ON",
       "source": "Peace Bridge Authority",
-      "streamUrl": "https://www.youtube.com/watch?v=WPMgP2C3_co",
+      "streamUrl": "https://www.youtube.com/watch?v=DnUFAShZKus",
       "type": "youtube",
       "resolution": "1280x720",
-      "linePoints": "0.266,0.502,0.763,0.499",
-      "linePoints2": "0.266,0.602,0.763,0.599",
-      "notes": "Canadian inspection plaza, dual parallel lines at ~50% and ~60% Y (10% apart)"
+      "primary": true,
+      "linePoints": "0.15,0.75,0.85,0.75",
+      "linePoints2": "0.330,0.451,0.646,0.448",
+      "notes": "Line 1 at 75% Y (bottom), Line 2 at 45% Y (mid-bridge)"
     }
   ]
 }
