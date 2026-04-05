@@ -53,6 +53,24 @@ except ImportError as e:
     print("Run: pip install ultralytics supervision websockets opencv-python")
     sys.exit(1)
 
+# Fast JPEG encoding — turbojpeg is 3-5x faster than cv2.imencode
+try:
+    from turbojpeg import TurboJPEG, TJFLAG_FASTDCT
+    _tjpeg = TurboJPEG()
+    def _fast_jpeg_encode(frame, quality=55):
+        return _tjpeg.encode(frame, quality=quality, flags=TJFLAG_FASTDCT)
+    def _fast_jpeg_decode(buf):
+        return _tjpeg.decode(buf)
+    print("[Init] Using TurboJPEG for fast encode/decode")
+except ImportError:
+    _tjpeg = None
+    def _fast_jpeg_encode(frame, quality=55):
+        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        return buf.tobytes()
+    def _fast_jpeg_decode(buf):
+        return cv2.imdecode(np.frombuffer(buf, dtype=np.uint8), cv2.IMREAD_COLOR)
+    print("[Init] TurboJPEG not found, using cv2 (pip install PyTurboJPEG for 3-5x faster)")
+
 
 # Vehicle classes in COCO dataset
 VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
@@ -64,6 +82,10 @@ NEON_YELLOW = (0, 204, 255)
 
 # Output frame width — higher = better detection but larger JPEG
 OUTPUT_WIDTH = int(os.environ.get('OUTPUT_WIDTH', '1280'))
+# YOLO inference resolution — 640 is 2x faster than 960, sufficient for highway cams
+YOLO_IMGSZ = int(os.environ.get('YOLO_IMGSZ', '640'))
+# WS JPEG quality — lower = smaller frames = less network latency
+WS_JPEG_QUALITY = int(os.environ.get('WS_JPEG_QUALITY', '45'))
 
 
 class VehicleCounter:
@@ -292,7 +314,7 @@ class VehicleCounter:
         results = self.model.track(
             frame, verbose=False, conf=self.confidence,
             classes=VEHICLE_CLASSES, persist=True,
-            tracker="bytetrack.yaml", imgsz=960, device=0, half=True
+            tracker="bytetrack.yaml", imgsz=YOLO_IMGSZ, device=0, half=True
         )[0]
         _t_det_done = time.monotonic()
 
@@ -1634,9 +1656,9 @@ class StreamServer:
                         (frame_h[0], OUTPUT_WIDTH, 3)).copy()
 
                     # Store JPEG-compressed frame in buffer (saves ~30x memory)
-                    _, jpg = cv2.imencode('.jpg', f, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    jpg = _fast_jpeg_encode(f, quality=90)
                     with _buf_lock:
-                        _frame_buf.append(jpg.tobytes())
+                        _frame_buf.append(jpg)
                         buf_len = len(_frame_buf)
 
                     # Log buffer fill progress
@@ -1657,9 +1679,10 @@ class StreamServer:
         threading.Thread(target=_reader, daemon=True).start()
 
         # YOLO inference thread
-        _yolo_q = _queue.Queue(maxsize=5)
+        _yolo_q = _queue.Queue(maxsize=2)  # smaller queue = fresher frames
         _yolo_result = [None, 0]
         _yolo_lock = threading.Lock()
+        _yolo_ready = threading.Event()  # signaled when new YOLO result available
 
         _yolo_frame_id = [0]
         _yolo_last_log = [time.monotonic()]
@@ -1669,6 +1692,12 @@ class StreamServer:
                     yf = _yolo_q.get(timeout=1)
                 except _queue.Empty:
                     continue
+                # Drain queue — only process the latest frame
+                while not _yolo_q.empty():
+                    try:
+                        yf = _yolo_q.get_nowait()
+                    except _queue.Empty:
+                        break
                 t0 = time.monotonic()
                 yolo_input = self.apply_roi(yf)
                 annotated, cnt = self.counter.process_frame(yolo_input)
@@ -1676,6 +1705,7 @@ class StreamServer:
                 with _yolo_lock:
                     _yolo_result[0] = annotated
                     _yolo_result[1] = cnt
+                _yolo_ready.set()  # notify main loop
 
                 # Push YOLO-annotated frame to CF queue (only when CF is active).
                 if self._cf.enabled and self._cf._proc is not None:
@@ -1759,9 +1789,7 @@ class StreamServer:
                     buf_remain = len(_frame_buf)
 
                 # Decode JPEG back to BGR
-                frame = cv2.imdecode(
-                    np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
-                )
+                frame = _fast_jpeg_decode(jpg_bytes)
                 _t_get = time.monotonic()
 
                 frame_idx += 1
@@ -1778,6 +1806,10 @@ class StreamServer:
                     _yolo_q.put_nowait(frame.copy())
                 except _queue.Full:
                     pass
+
+                # Wait briefly for YOLO result to avoid sending stale frames
+                _yolo_ready.wait(timeout=0.05)
+                _yolo_ready.clear()
 
                 # Use latest YOLO result
                 with _yolo_lock:
@@ -1819,8 +1851,7 @@ class StreamServer:
 
                 # Broadcast binary JPEG frame to WS clients — every frame for max smoothness
                 if self.clients:
-                    _, jpeg_ws = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 55])
-                    jpeg_data = jpeg_ws.tobytes()
+                    jpeg_data = _fast_jpeg_encode(display, quality=WS_JPEG_QUALITY)
                     async def _send_binary(data):
                         dead = set()
                         sends = []
@@ -1842,9 +1873,12 @@ class StreamServer:
                                     pass
                     asyncio.run_coroutine_threadsafe(_send_binary(jpeg_data), loop)
 
+                _t_ws = time.monotonic()
+
                 # Debug timing every 5s
                 if frame_idx % 150 == 0:
-                    print(f"[MainLoop] get={(_t_get-_t0)*1000:.0f}ms proc={(_t_proc-_t_get)*1000:.0f}ms cf={(_t_cf-_t_proc)*1000:.0f}ms total={(_t_cf-_t0)*1000:.0f}ms buf={buf_remain}")
+                    jpeg_kb = len(jpeg_data) / 1024 if 'jpeg_data' in dir() and self.clients else 0
+                    print(f"[MainLoop] get={(_t_get-_t0)*1000:.0f}ms proc={(_t_proc-_t_get)*1000:.0f}ms cf={(_t_cf-_t_proc)*1000:.0f}ms ws={(_t_ws-_t_cf)*1000:.0f}ms jpeg={jpeg_kb:.0f}KB total={(_t_ws-_t0)*1000:.0f}ms buf={buf_remain} imgsz={YOLO_IMGSZ}")
 
                 # WS: JSON state updates at 1Hz
                 now = time.time()
