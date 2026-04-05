@@ -1510,11 +1510,11 @@ class StreamServer:
         frame_interval = 1.0 / self.target_fps
         server_start = time.time()
 
-        # Reader thread with large JPEG buffer for smooth playback
+        # Reader thread with raw numpy buffer for smooth playback
         import threading
         import collections
-        # Buffer: store JPEG-compressed frames to save memory
-        # 2 min @ 30fps = 3600 frames × ~50KB = ~180MB — very manageable
+        # Buffer: store raw numpy frames — no JPEG encode/decode overhead
+        # 10s @ 30fps = 300 frames × 2.7MB = ~810MB (fine for 15GB RAM)
         BUFFER_DELAY_SECS = int(os.environ.get('BUFFER_DELAY', '120'))
         BUFFER_TARGET = int(30 * BUFFER_DELAY_SECS)  # frames to buffer before playback
         BUFFER_MAX = BUFFER_TARGET + 300  # headroom
@@ -1543,22 +1543,43 @@ class StreamServer:
                 _ff_proc_holder[0] = None
 
         def _start_ff(url):
-            """Start ffmpeg decoder: HLS URL → raw BGR frames on stdout."""
+            """Start ffmpeg decoder: HLS URL → raw BGR frames on stdout.
+            Uses NVDEC hardware decode if available (offloads CPU → GPU)."""
             _kill_ff()
-            cmd = [
-                'ffmpeg',
-                '-loglevel', 'warning',
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '5',
-                '-rw_timeout', '5000000',  # 5s network timeout (microseconds)
-                '-i', url,
-                '-vf', f'scale={OUTPUT_WIDTH}:-2',
-                '-pix_fmt', 'bgr24',
-                '-f', 'rawvideo',
-                '-an',
-                'pipe:1',
-            ]
+            # Try NVDEC hardware decode first, fallback to CPU
+            use_hwdec = os.environ.get('FFMPEG_HWDEC', '1') == '1'
+            if use_hwdec:
+                cmd = [
+                    'ffmpeg',
+                    '-loglevel', 'warning',
+                    '-hwaccel', 'cuda',
+                    '-hwaccel_output_format', 'cuda',
+                    '-reconnect', '1',
+                    '-reconnect_streamed', '1',
+                    '-reconnect_delay_max', '5',
+                    '-rw_timeout', '5000000',
+                    '-i', url,
+                    '-vf', f'scale_cuda={OUTPUT_WIDTH}:-2,hwdownload,format=bgr24',
+                    '-pix_fmt', 'bgr24',
+                    '-f', 'rawvideo',
+                    '-an',
+                    'pipe:1',
+                ]
+            else:
+                cmd = [
+                    'ffmpeg',
+                    '-loglevel', 'warning',
+                    '-reconnect', '1',
+                    '-reconnect_streamed', '1',
+                    '-reconnect_delay_max', '5',
+                    '-rw_timeout', '5000000',
+                    '-i', url,
+                    '-vf', f'scale={OUTPUT_WIDTH}:-2',
+                    '-pix_fmt', 'bgr24',
+                    '-f', 'rawvideo',
+                    '-an',
+                    'pipe:1',
+                ]
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -1655,10 +1676,9 @@ class StreamServer:
                     f = np.frombuffer(raw, dtype=np.uint8).reshape(
                         (frame_h[0], OUTPUT_WIDTH, 3)).copy()
 
-                    # Store JPEG-compressed frame in buffer (saves ~30x memory)
-                    jpg = _fast_jpeg_encode(f, quality=90)
+                    # Store raw numpy frame directly — no CPU-heavy JPEG encode
                     with _buf_lock:
-                        _frame_buf.append(jpg)
+                        _frame_buf.append(f)
                         buf_len = len(_frame_buf)
 
                     # Log buffer fill progress
@@ -1785,11 +1805,8 @@ class StreamServer:
                     if not _frame_buf:
                         time.sleep(0.005)
                         continue
-                    jpg_bytes = _frame_buf.popleft()
+                    frame = _frame_buf.popleft()
                     buf_remain = len(_frame_buf)
-
-                # Decode JPEG back to BGR
-                frame = _fast_jpeg_decode(jpg_bytes)
                 _t_get = time.monotonic()
 
                 frame_idx += 1
