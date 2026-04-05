@@ -1752,7 +1752,7 @@ class StreamServer:
 
         last_ws_time = 0
         _playback_clock = [None]  # monotonic time of first frame consumed
-        _ws_sending = [False]  # True while async WS send is in-flight — skip frames to avoid backlog
+        _ws_skip_count = [0]  # count of skipped WS frames for logging
 
         # Wait for buffer to fill before starting playback
         print(f"[Buffer] Buffering {BUFFER_DELAY_SECS}s of video for smooth playback...")
@@ -1868,27 +1868,26 @@ class StreamServer:
                 _t_cf = time.monotonic()
 
                 # Broadcast binary JPEG frame to WS clients
-                if self.clients and not _ws_sending[0]:
+                if self.clients:
                     jpeg_data = _fast_jpeg_encode(display, quality=WS_JPEG_QUALITY)
                     async def _send_binary(data):
-                        _ws_sending[0] = True
-                        try:
-                            dead = set()
-                            for ws in list(self.clients):
+                        dead = set()
+                        tasks = []
+                        clients = list(self.clients)
+                        for ws in clients:
+                            tasks.append(asyncio.wait_for(ws.send(data), timeout=1.0))
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
+                        for ws, result in zip(clients, results):
+                            if isinstance(result, Exception):
+                                dead.add(ws)
+                        if dead:
+                            self.clients -= dead
+                            print(f"[WS] Removed {len(dead)} slow client(s), {len(self.clients)} remain")
+                            for ws in dead:
                                 try:
-                                    await asyncio.wait_for(ws.send(data), timeout=0.5)
+                                    await ws.close()
                                 except Exception:
-                                    dead.add(ws)
-                            if dead:
-                                self.clients -= dead
-                                print(f"[WS] Removed {len(dead)} slow client(s), {len(self.clients)} remain")
-                                for ws in dead:
-                                    try:
-                                        await ws.close()
-                                    except Exception:
-                                        pass
-                        finally:
-                            _ws_sending[0] = False
+                                    pass
                     asyncio.run_coroutine_threadsafe(_send_binary(jpeg_data), loop)
 
                 _t_ws = time.monotonic()
