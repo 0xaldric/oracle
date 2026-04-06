@@ -1875,7 +1875,7 @@ class StreamServer:
                         tasks = []
                         clients = list(self.clients)
                         for ws in clients:
-                            tasks.append(asyncio.wait_for(ws.send(data), timeout=1.0))
+                            tasks.append(asyncio.wait_for(ws.send(data), timeout=3.0))
                         results = await asyncio.gather(*tasks, return_exceptions=True)
                         for ws, result in zip(clients, results):
                             if isinstance(result, Exception):
