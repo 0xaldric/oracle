@@ -1872,17 +1872,14 @@ class StreamServer:
                     jpeg_data = _fast_jpeg_encode(display, quality=WS_JPEG_QUALITY)
                     async def _send_binary(data):
                         dead = set()
-                        tasks = []
-                        clients = list(self.clients)
-                        for ws in clients:
-                            tasks.append(asyncio.wait_for(ws.send(data), timeout=3.0))
-                        results = await asyncio.gather(*tasks, return_exceptions=True)
-                        for ws, result in zip(clients, results):
-                            if isinstance(result, Exception):
+                        for ws in list(self.clients):
+                            try:
+                                await ws.send(data)
+                            except Exception:
                                 dead.add(ws)
                         if dead:
                             self.clients -= dead
-                            print(f"[WS] Removed {len(dead)} slow client(s), {len(self.clients)} remain")
+                            print(f"[WS] Removed {len(dead)} dead client(s), {len(self.clients)} remain")
                             for ws in dead:
                                 try:
                                     await ws.close()
