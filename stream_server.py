@@ -1878,8 +1878,11 @@ class StreamServer:
                     self._cf.send_frame(display)
                 _t_cf = time.monotonic()
 
-                # Broadcast binary JPEG frame to WS clients
-                if self.clients:
+                # Broadcast binary JPEG frame to WS clients — throttle to ~15fps
+                # 30fps × 90KB = 2.7MB/s — too much for slow clients, causes disconnects
+                _ws_now = time.monotonic()
+                if self.clients and (_ws_now - _last_ws_binary) >= 0.066:  # ~15fps
+                    _last_ws_binary = _ws_now
                     jpeg_data = _fast_jpeg_encode(display, quality=WS_JPEG_QUALITY)
                     async def _send_binary(data):
                         dead = set()
