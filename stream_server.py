@@ -565,7 +565,8 @@ class VehicleCounter:
 
 
 _URL_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".url_cache.json")
-_URL_CACHE_TTL = 3600  # 1 hour — HLS URLs expire, force refresh sooner
+_URL_CACHE_TTL = int(os.environ.get('YT_CACHE_TTL', '18000'))  # 5 hours — reduce yt-dlp calls to avoid rate limit
+_yt_backoff = [0]  # exponential backoff seconds when rate limited
 
 def _load_url_cache():
     try:
@@ -616,6 +617,11 @@ def get_stream_url(youtube_url, force_refresh=False):
         ['yt-dlp'] + cookies_args + ['-f', 'best', '-g', youtube_url],
     ]
 
+    # Backoff: wait before retrying if previously rate-limited
+    if _yt_backoff[0] > 0:
+        print(f"[yt-dlp] Rate-limit backoff: waiting {_yt_backoff[0]}s...")
+        time.sleep(_yt_backoff[0])
+
     for cmd in commands:
         try:
             print(f"[yt-dlp] Running: {' '.join(cmd[:4])}...")
@@ -625,9 +631,14 @@ def get_stream_url(youtube_url, force_refresh=False):
                 print(f"[yt-dlp] OK: {url[:80]}...")
                 cache[youtube_url] = [url, time.time()]
                 _save_url_cache(cache)
+                _yt_backoff[0] = 0  # reset backoff on success
                 return url
             else:
-                print(f"[yt-dlp] Failed (code={result.returncode}): {result.stderr.strip()[-200:]}")
+                err = result.stderr.strip()[-200:]
+                print(f"[yt-dlp] Failed (code={result.returncode}): {err}")
+                if 'rate' in err.lower() or 'rate-limit' in err.lower():
+                    _yt_backoff[0] = min(300, max(30, _yt_backoff[0] * 2 or 30))
+                    print(f"[yt-dlp] Rate limited! Next backoff: {_yt_backoff[0]}s")
         except FileNotFoundError:
             print(f"[yt-dlp] ERROR: yt-dlp not found in PATH")
             return youtube_url
